@@ -1,0 +1,120 @@
+import type {
+  HealthResponse,
+  JobCreateResponse,
+  JobResponse,
+  UploadResponse,
+} from "./types";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "dev-api-key-change-me";
+
+const DEFAULT_TIMEOUT_MS = 120_000;
+
+function headers(json = false): HeadersInit {
+  const h: Record<string, string> = {
+    "X-API-Key": API_KEY,
+  };
+  if (json) h["Content-Type"] = "application/json";
+  return h;
+}
+
+async function request(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = DEFAULT_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new Error("Request timed out — is the backend running on :8000?");
+    }
+    throw new Error(
+      err instanceof Error
+        ? `Network error: ${err.message}. Is the API at ${API_URL}?`
+        : "Network error talking to the API"
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handle<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    let detail: unknown = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail ?? body;
+    } catch {
+      /* ignore */
+    }
+    const message =
+      typeof detail === "string"
+        ? detail
+        : Array.isArray(detail)
+          ? detail.map((d) => d.msg || JSON.stringify(d)).join("; ")
+          : JSON.stringify(detail);
+    throw new Error(message || `HTTP ${res.status}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export async function getHealth(): Promise<HealthResponse> {
+  const res = await request(`${API_URL}/health`, {}, 8_000);
+  return handle(res);
+}
+
+export async function uploadFiles(
+  videos: File[],
+  assets: File[]
+): Promise<UploadResponse> {
+  const form = new FormData();
+  videos.forEach((f) => form.append("videos", f));
+  assets.forEach((f) => form.append("assets", f));
+  const res = await request(`${API_URL}/uploads`, {
+    method: "POST",
+    headers: { "X-API-Key": API_KEY },
+    body: form,
+  });
+  return handle(res);
+}
+
+export async function createJob(
+  uploadId: string,
+  prompt: string
+): Promise<JobCreateResponse> {
+  const res = await request(`${API_URL}/jobs`, {
+    method: "POST",
+    headers: headers(true),
+    body: JSON.stringify({ upload_id: uploadId, prompt }),
+  });
+  return handle(res);
+}
+
+export async function getJob(jobId: string): Promise<JobResponse> {
+  const res = await request(
+    `${API_URL}/jobs/${jobId}`,
+    {
+      headers: headers(),
+      cache: "no-store",
+    },
+    15_000
+  );
+  return handle(res);
+}
+
+export async function cancelJob(jobId: string): Promise<JobResponse> {
+  const res = await request(`${API_URL}/jobs/${jobId}/cancel`, {
+    method: "POST",
+    headers: headers(),
+  });
+  return handle(res);
+}
+
+export function downloadUrl(jobId: string): string {
+  return `${API_URL}/jobs/${jobId}/download`;
+}
+
+export { API_KEY, API_URL };

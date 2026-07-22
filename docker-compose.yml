@@ -1,0 +1,38 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:///./app.db
+      STORAGE_ROOT: ./storage
+      CORS_ORIGINS: http://localhost:3000
+      API_KEY: ${API_KEY:-dev-api-key-change-me}
+      AUTH_ENABLED: "true"
+      RATE_LIMIT_PER_MINUTE: "60"
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5}
+      LLM_PROVIDER: ollama
+      MAX_CONCURRENT_RENDERS: "2"
+    volumes:
+      - backend_storage:/app/storage
+      - backend_db:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_API_KEY: ${API_KEY:-dev-api-key-change-me}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend_storage:
+  backend_db:

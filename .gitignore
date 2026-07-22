@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.db
+*.db-shm
+*.db-wal
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+frontend/.env.local
+frontend/.env
+
+# Storage / runtime
+backend/storage/uploads/
+backend/storage/assets/
+backend/storage/outputs/
+backend/storage/zips/
+backend/*.db
+backend/app.db
+
+# Local tool binaries (FFmpeg, etc.)
+tools/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+
+# Docker
+.docker/

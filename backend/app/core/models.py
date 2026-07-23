@@ -38,6 +38,11 @@ class AssetKind(str, enum.Enum):
     video = "video"
 
 
+class RenderEngine(str, enum.Enum):
+    bulkcut = "bulkcut"
+    creatomate = "creatomate"
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -47,6 +52,9 @@ class Job(Base):
     )
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
     instructions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    engine: Mapped[str] = mapped_column(
+        String(32), default=RenderEngine.bulkcut.value, nullable=False, index=True
+    )
     upload_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     zip_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -85,6 +93,9 @@ class JobItem(Base):
     progress: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    occurrences_replaced: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preview_before_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    preview_after_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

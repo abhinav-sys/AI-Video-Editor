@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
 import tempfile
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,7 +14,9 @@ from app.api.schemas.edits import EditInstructions, WatermarkPosition
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.services.storage import StorageService
-from app.services.text_locate import TextRegion, pick_regions_for_replacements
+from app.services.ocr_audit import audit_dir_for_job, write_audit_snapshot
+from app.services.text_heal import HealedPatch, inpaint_video_under_mask, write_heal_artifacts
+from app.services.text_ocr import RenderRegion, ocr_best_regions_for_replacements
 
 logger = get_logger(__name__)
 
@@ -25,9 +29,32 @@ POSITION_EXPR = {
 }
 
 
+@dataclass
+class RenderResult:
+    occurrences: int
+    preview_before: Path | None
+    preview_after: Path | None
+
+
 @lru_cache
-def detect_system_font() -> str | None:
+def detect_system_font(*, bold: bool = False) -> str | None:
     """Find a usable TrueType font for FFmpeg drawtext on Windows/macOS/Linux."""
+    if bold:
+        bold_candidates = [
+            r"C:\Windows\Fonts\arialbd.ttf",
+            r"C:\Windows\Fonts\segoeuib.ttf",
+            r"C:\Windows\Fonts\calibrib.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+        windir = os.environ.get("WINDIR")
+        if windir:
+            bold_candidates.insert(0, str(Path(windir) / "Fonts" / "arialbd.ttf"))
+        for path in bold_candidates:
+            if Path(path).is_file():
+                return path
     candidates = [
         r"C:\Windows\Fonts\arial.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
@@ -51,12 +78,20 @@ class FFmpegService:
         self.settings = get_settings()
         self.storage = storage or StorageService()
 
-    def _font_opt(self) -> str:
-        font = self.settings.ffmpeg_fontfile.strip() or detect_system_font() or ""
+    def _font_opt(self, *, bold: bool = False, fontfile: str | None = None) -> str:
+        if fontfile and Path(fontfile).is_file():
+            font = fontfile
+        else:
+            configured = self.settings.ffmpeg_fontfile.strip()
+            if configured and not bold:
+                font = configured
+            else:
+                font = detect_system_font(bold=bold) or detect_system_font(bold=False) or configured or ""
         if not font:
             return ""
         font_path = font.replace("\\", "/").replace(":", "\\:")
         return f":fontfile='{font_path}'"
+
 
     async def probe_duration(self, input_path: Path) -> float | None:
         cmd = [
@@ -82,6 +117,131 @@ class FFmpegService:
         except Exception:
             return None
 
+    async def probe_video_size(self, input_path: Path) -> tuple[int, int] | None:
+        cmd = [
+            self.settings.ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            str(input_path),
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return None
+            raw = stdout.decode().strip()
+            if "x" not in raw:
+                return None
+            w_s, h_s = raw.split("x", 1)
+            return int(w_s), int(h_s)
+        except Exception:
+            return None
+
+    async def locate_text_regions(
+        self,
+        input_path: Path,
+        replacements: list,
+        *,
+        preview_dir: Path | None = None,
+        progress_cb=None,
+    ) -> tuple[list[RenderRegion], Path | None, float]:
+        """OCR sample frames and return paint regions + optional before-preview.
+
+        Returns (regions, preview_before_path, sample_time_seconds).
+        """
+        duration = await self.probe_duration(input_path)
+        if duration and duration > 3:
+            # Extra late samples catch banners that fade in after the open.
+            candidates = [
+                min(max(duration * p, 0.5), max(duration - 0.5, 0.5))
+                for p in (0.15, 0.35, 0.55, 0.75)
+            ]
+        else:
+            candidates = [1.0]
+        sample_at = candidates[0]
+        preview_before: Path | None = None
+
+        with tempfile.TemporaryDirectory(prefix="vgai_frame_") as tmp:
+            frame_paths: list[Path] = []
+            for idx, at in enumerate(candidates):
+                frame_path = Path(tmp) / f"sample_{idx}.png"
+                if await self._extract_frame(input_path, frame_path, at_seconds=at):
+                    frame_paths.append(frame_path)
+                if progress_cb:
+                    # 12% → ~20% while extracting / before heavy OCR
+                    pct = 12.0 + (idx + 1) / max(1, len(candidates)) * 6.0
+                    await progress_cb(min(18.0, pct))
+            if not frame_paths:
+                raise RuntimeError("Failed to extract sample frames for OCR")
+
+            if progress_cb:
+                await progress_cb(19.0)
+
+            ocr_error: str | None = None
+            try:
+                text_regions, best_frame = await asyncio.to_thread(
+                    ocr_best_regions_for_replacements,
+                    frame_paths,
+                    replacements,
+                )
+            except Exception as exc:
+                ocr_error = str(exc)
+                text_regions, best_frame = [], None
+                # Persist audit then re-raise so jobs still fail clearly
+                if preview_dir is not None:
+                    preview_dir.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(
+                        write_audit_snapshot,
+                        audit_dir_for_job(preview_dir),
+                        replacements=replacements,
+                        frame_paths=frame_paths,
+                        sample_times=candidates,
+                        regions=[],
+                        best_frame=frame_paths[0] if frame_paths else None,
+                        error=ocr_error,
+                        dump_ocr=False,
+                        paint_still=False,
+                    )
+                raise
+
+            logger.info("OCR located %d text region(s)", len(text_regions))
+
+            if preview_dir is not None:
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                if best_frame is not None:
+                    preview_before = preview_dir / "preview_before.png"
+                    preview_before.write_bytes(best_frame.read_bytes())
+                    try:
+                        idx = frame_paths.index(best_frame)
+                        sample_at = candidates[idx]
+                    except ValueError:
+                        pass
+                await asyncio.to_thread(
+                    write_audit_snapshot,
+                    audit_dir_for_job(preview_dir),
+                    replacements=replacements,
+                    frame_paths=frame_paths,
+                    sample_times=candidates,
+                    regions=text_regions,
+                    best_frame=best_frame,
+                    dump_ocr=False,
+                    paint_still=True,
+                )
+
+        if progress_cb:
+            await progress_cb(22.0)
+        return text_regions, preview_before, sample_at
+
     def _escape_drawtext(self, text: str) -> str:
         return (
             text.replace("\\", "\\\\")
@@ -90,6 +250,11 @@ class FFmpegService:
             .replace("%", "\\%")
             .replace("&", "\\&")
         )
+
+    @staticmethod
+    def _rgb_hex(rgb: tuple[int, int, int]) -> str:
+        r, g, b = rgb
+        return f"0x{r:02X}{g:02X}{b:02X}"
 
     async def _extract_frame(self, input_path: Path, dest: Path, at_seconds: float = 1.0) -> bool:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -114,53 +279,103 @@ class FFmpegService:
         await proc.communicate()
         return proc.returncode == 0 and dest.is_file()
 
+    async def _mux_audio(self, video_path: Path, audio_src: Path, dest: Path) -> bool:
+        """Copy video stream from video_path and audio from audio_src."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            self.settings.ffmpeg_path,
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(audio_src),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0?",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(dest),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        return proc.returncode == 0 and dest.is_file()
+
     def build_filter_complex(
         self,
         instructions: EditInstructions,
         logo_path: Path | None,
         watermark_path: Path | None,
-        text_regions: list[TextRegion] | None = None,
+        text_regions: list[RenderRegion] | None = None,
+        healed_patches: list[HealedPatch] | None = None,
+        removelogo_mask: Path | None = None,
     ) -> tuple[list[str], str]:
         inputs: list[str] = []
         filters: list[str] = []
         current = "[0:v]"
         input_index = 1
-        font_opt = self._font_opt()
         regions = text_regions or []
+        patches = healed_patches or []
 
-        for i, pair in enumerate(instructions.replace_text):
-            box_label = f"[tb{i}]"
-            label = f"[t{i}]"
-            text = self._escape_drawtext(pair.to)
-            region = regions[i] if i < len(regions) else None
+        if instructions.replace_text:
+            if not regions:
+                # No silent fallback band — OCR must find the text.
+                raise ValueError(
+                    "No OCR text regions to replace. "
+                    "The requested text was not found on sampled frames."
+                )
+            # Invisible heal:
+            # - video-bg glyphs: removelogo (per-frame) via mask
+            # - banner glyphs: static soft-fill RGBA overlays
+            # Never use opaque drawbox stamps.
+            if removelogo_mask is not None and removelogo_mask.is_file():
+                mask_esc = str(removelogo_mask.resolve()).replace("\\", "/").replace(":", "\\:")
+                label = "[rl]"
+                filters.append(f"{current}removelogo=filename='{mask_esc}'{label}")
+                current = label
 
-            if region is not None:
-                # Cover only the detected date/text line inside the existing banner,
-                # then redraw replacement text in that same slot.
-                r, g, b = region.fill_rgb
-                color = f"0x{r:02X}{g:02X}{b:02X}"
-                text_y = region.y + max(0, (region.h - region.fontsize) // 2)
+            for i, patch in enumerate(patches):
+                # Static soft-fill overlays for banner/flat plates; inpaint is per-frame.
+                if getattr(patch, "mode", "banner") == "inpaint":
+                    continue
+                if not patch.path.is_file():
+                    continue
+                inputs.extend(["-i", str(patch.path)])
+                label = f"[hp{i}]"
                 filters.append(
-                    f"{current}drawbox=x={region.x}:y={region.y}:w={region.w}:h={region.h}:"
-                    f"color={color}@1:t=fill{box_label}"
+                    f"{current}[{input_index}:v]overlay={patch.x}:{patch.y}:format=auto{label}"
                 )
+                current = label
+                input_index += 1
+
+            for i, region in enumerate(regions):
+                label = f"[t{i}]"
+                text = self._escape_drawtext(region.text)
+                fontcolor = self._rgb_hex(region.font_rgb)
+                font_opt = self._font_opt(
+                    bold=getattr(region, "bold", False),
+                    fontfile=getattr(region, "fontfile", None),
+                )
+                if getattr(region, "text_y", 0):
+                    text_y = region.text_y
+                else:
+                    text_y = region.y + max(0, (region.h - region.fontsize) // 2)
+                if region.align == "center":
+                    text_x = f"{region.x}+({region.w}-text_w)/2"
+                else:
+                    text_x = str(region.x + 2)
                 filters.append(
-                    f"{box_label}drawtext=text='{text}':fontsize={region.fontsize}:"
-                    f"fontcolor=white:x=(w-text_w)/2:y={text_y}{font_opt}{label}"
+                    f"{current}drawtext=text='{text}':fontsize={region.fontsize}:"
+                    f"fontcolor={fontcolor}:x={text_x}:y={text_y}{font_opt}{label}"
                 )
-            else:
-                # Fallback: thin lower-third band if banner detection fails
-                band_h = 48
-                bottom_pad = (len(instructions.replace_text) - 1 - i) * band_h + 220
-                filters.append(
-                    f"{current}drawbox=x=80:y=ih-{band_h + bottom_pad}:w=iw-160:h={band_h}:"
-                    f"color=0x0A2F42@1:t=fill{box_label}"
-                )
-                filters.append(
-                    f"{box_label}drawtext=text='{text}':fontsize=32:fontcolor=white:"
-                    f"x=(w-text_w)/2:y=h-th-{bottom_pad + 12}{font_opt}{label}"
-                )
-            current = label
+                current = label
 
         if instructions.replace_logo and logo_path and logo_path.is_file():
             inputs.extend(["-i", str(logo_path)])
@@ -186,6 +401,7 @@ class FFmpegService:
                 input_index += 1
             else:
                 label = "[wm]"
+                font_opt = self._font_opt(bold=False)
                 filters.append(
                     f"{current}drawtext=text='WATERMARK':fontsize=24:fontcolor=white@0.6:"
                     f"x=w-tw-20:y=h-th-20{font_opt}{label}"
@@ -204,7 +420,9 @@ class FFmpegService:
         instructions: EditInstructions,
         upload_id: str,
         progress_cb=None,
-    ) -> None:
+        preview_dir: Path | None = None,
+        text_regions: list[RenderRegion] | None = None,
+    ) -> RenderResult:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
             output_path.unlink()
@@ -218,53 +436,146 @@ class FFmpegService:
         elif instructions.replace_logo:
             watermark_path = logo_path
 
-        text_regions: list[TextRegion] = []
-        if instructions.replace_text:
-            duration = await self.probe_duration(input_path)
-            # Try a few sample times; keep the frame that yields the best date-line hit.
+        preview_before: Path | None = None
+        preview_after: Path | None = None
+        sample_at_for_preview = 1.0
+        # Allow callers (audit CLI) to supply regions and skip a second EasyOCR pass.
+        resolved_regions: list[RenderRegion] = list(text_regions or [])
+        heal_source: Path | None = None
+
+        duration = await self.probe_duration(input_path)
+
+        if instructions.replace_text and not resolved_regions:
             if duration and duration > 3:
+                # Extra mid/late samples catch overlays that fade in after the open.
                 candidates = [
                     min(max(duration * p, 0.5), max(duration - 0.5, 0.5))
-                    for p in (0.12, 0.22, 0.35)
+                    for p in (0.12, 0.22, 0.35, 0.50, 0.65)
                 ]
             else:
                 candidates = [1.0]
-            best: list[TextRegion] = []
+            sample_at_for_preview = candidates[0]
+
             with tempfile.TemporaryDirectory(prefix="vgai_frame_") as tmp:
+                frame_paths: list[Path] = []
                 for idx, sample_at in enumerate(candidates):
                     frame_path = Path(tmp) / f"sample_{idx}.png"
-                    if not await self._extract_frame(input_path, frame_path, at_seconds=sample_at):
-                        continue
-                    try:
-                        found = pick_regions_for_replacements(
-                            frame_path, len(instructions.replace_text)
+                    if await self._extract_frame(input_path, frame_path, at_seconds=sample_at):
+                        frame_paths.append(frame_path)
+                if not frame_paths:
+                    raise RuntimeError("Failed to extract sample frames for OCR")
+
+                try:
+                    resolved_regions, best_frame = await asyncio.to_thread(
+                        ocr_best_regions_for_replacements,
+                        frame_paths,
+                        instructions.replace_text,
+                    )
+                except Exception as exc:
+                    if preview_dir is not None:
+                        preview_dir.mkdir(parents=True, exist_ok=True)
+                        await asyncio.to_thread(
+                            write_audit_snapshot,
+                            audit_dir_for_job(preview_dir),
+                            replacements=instructions.replace_text,
+                            frame_paths=frame_paths,
+                            sample_times=candidates,
+                            regions=[],
+                            best_frame=frame_paths[0],
+                            error=str(exc),
+                            dump_ocr=False,
+                            paint_still=False,
                         )
-                    except Exception as exc:
-                        logger.warning("Banner text locate failed at t=%.1f: %s", sample_at, exc)
-                        continue
-                    if len(found) > len(best):
-                        best = found
-                    elif len(found) == len(best) == len(instructions.replace_text):
-                        # Prefer thinner (more text-line-like) boxes
-                        if found and best and found[-1].h < best[-1].h:
-                            best = found
-                text_regions = best
+                    raise
+
                 logger.info(
-                    "Located %d banner text region(s) for in-place replace",
-                    len(text_regions),
+                    "OCR located %d text region(s) for in-place replace",
+                    len(resolved_regions),
                 )
 
-        extra_inputs, filter_complex = self.build_filter_complex(
-            instructions, logo_path, watermark_path, text_regions=text_regions
-        )
+                # Keep a durable before-preview from the matched frame
+                if preview_dir is not None:
+                    preview_dir.mkdir(parents=True, exist_ok=True)
+                if best_frame is not None:
+                    durable = (preview_dir or output_path.parent) / "preview_before.png"
+                    if preview_dir is not None:
+                        preview_dir.mkdir(parents=True, exist_ok=True)
+                    durable.parent.mkdir(parents=True, exist_ok=True)
+                    durable.write_bytes(best_frame.read_bytes())
+                    preview_before = durable
+                    heal_source = durable
+                    try:
+                        idx = frame_paths.index(best_frame)
+                        sample_at_for_preview = candidates[idx]
+                    except ValueError:
+                        pass
+                if preview_dir is not None:
+                    await asyncio.to_thread(
+                        write_audit_snapshot,
+                        audit_dir_for_job(preview_dir),
+                        replacements=instructions.replace_text,
+                        frame_paths=frame_paths,
+                        sample_times=candidates,
+                        regions=resolved_regions,
+                        best_frame=best_frame,
+                        dump_ocr=False,
+                        paint_still=True,
+                    )
 
-        duration = await self.probe_duration(input_path)
+        # Invisible heal patches for text replace (no opaque drawbox)
+        healed_patches: list[HealedPatch] = []
+        removelogo_mask: Path | None = None
+        if instructions.replace_text and resolved_regions:
+            if heal_source is None or not heal_source.is_file():
+                heal_dir = preview_dir or output_path.parent
+                heal_dir.mkdir(parents=True, exist_ok=True)
+                heal_source = heal_dir / "heal_source.png"
+                ok = await self._extract_frame(
+                    input_path, heal_source, at_seconds=sample_at_for_preview
+                )
+                if not ok:
+                    raise RuntimeError("Failed to extract frame for text heal")
+                if preview_before is None:
+                    preview_before = heal_source
+            patch_dir = (preview_dir or output_path.parent) / "heal_patches"
+            healed_patches, removelogo_mask = await asyncio.to_thread(
+                write_heal_artifacts,
+                heal_source,
+                resolved_regions,
+                patch_dir,
+            )
+
+        # Video-bg glyphs: per-frame OpenCV inpaint (avoids frozen/removelogo plates).
+        # Banner glyphs stay as static soft-fill overlays in the filter graph.
+        render_input = input_path
+        if removelogo_mask is not None and removelogo_mask.is_file():
+            inpainted = (preview_dir or output_path.parent) / "video_inpainted.mp4"
+            await asyncio.to_thread(
+                inpaint_video_under_mask,
+                input_path,
+                removelogo_mask,
+                inpainted,
+            )
+            # Attach original audio onto the OpenCV intermediate
+            muxed = (preview_dir or output_path.parent) / "video_inpainted_a.mp4"
+            mux_ok = await self._mux_audio(inpainted, input_path, muxed)
+            render_input = muxed if mux_ok else inpainted
+            removelogo_mask = None  # already applied per-frame
+
+        extra_inputs, filter_complex = self.build_filter_complex(
+            instructions,
+            logo_path,
+            watermark_path,
+            text_regions=resolved_regions,
+            healed_patches=healed_patches,
+            removelogo_mask=removelogo_mask,
+        )
 
         cmd = [
             self.settings.ffmpeg_path,
             "-y",
             "-i",
-            str(input_path),
+            str(render_input),
             *extra_inputs,
         ]
 
@@ -324,18 +635,79 @@ class FFmpegService:
             tail = "\n".join(stderr_lines[-40:])
             raise RuntimeError(f"FFmpeg failed (code={code}): {tail}")
 
+        if preview_dir is not None:
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            if preview_before is None:
+                preview_before = preview_dir / "preview_before.png"
+                await self._extract_frame(input_path, preview_before, at_seconds=sample_at_for_preview)
+            preview_after = preview_dir / "preview_after.png"
+            await self._extract_frame(output_path, preview_after, at_seconds=sample_at_for_preview)
+
+            # Append full_video + verify gates onto job OCR audit when text was replaced
+            if instructions.replace_text and resolved_regions:
+                audit_path = audit_dir_for_job(preview_dir) / "audit.json"
+                if audit_path.is_file():
+                    try:
+                        from app.services.ocr_audit import verify_after_paint
+
+                        data = json.loads(audit_path.read_text(encoding="utf-8"))
+                        gates = data.setdefault("gates", [])
+                        # full_video
+                        gates = [g for g in gates if g.get("name") not in ("full_video", "verify_after")]
+                        gates.append(
+                            {
+                                "name": "full_video",
+                                "status": "pass",
+                                "reason": f"occurrences={len(resolved_regions)}",
+                                "elapsed_ms": 0,
+                                "details": {"occurrences": len(resolved_regions), "output": str(output_path)},
+                            }
+                        )
+                        if preview_after.is_file():
+                            v = await asyncio.to_thread(
+                                verify_after_paint,
+                                preview_after,
+                                instructions.replace_text,
+                                resolved_regions,
+                                out_json=audit_dir_for_job(preview_dir) / "verify_after_ocr.json",
+                            )
+                            gates.append(v.to_dict())
+                        data["gates"] = gates
+                        data["ok"] = all(
+                            g.get("status") in ("pass", "skip", "warn") for g in gates
+                        )
+                        audit_path.write_text(
+                            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to update OCR audit after render: %s", exc)
+
         if progress_cb:
             await progress_cb(100.0)
 
+        return RenderResult(
+            occurrences=len(resolved_regions),
+            preview_before=preview_before if preview_before and preview_before.is_file() else None,
+            preview_after=preview_after if preview_after and preview_after.is_file() else None,
+        )
+
     async def check_available(self) -> bool:
+        """Return True if ffmpeg binary runs. Uses a thread so Windows + reload works."""
+        def _probe() -> bool:
+            import subprocess
+
+            try:
+                proc = subprocess.run(
+                    [self.settings.ffmpeg_path, "-version"],
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+                return proc.returncode == 0
+            except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+                return False
+
         try:
-            proc = await asyncio.create_subprocess_exec(
-                self.settings.ffmpeg_path,
-                "-version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            return proc.returncode == 0
-        except FileNotFoundError:
+            return await asyncio.to_thread(_probe)
+        except Exception:
             return False

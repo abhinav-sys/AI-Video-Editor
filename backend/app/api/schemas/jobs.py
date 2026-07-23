@@ -8,8 +8,16 @@ from app.core.models import ItemStatus, JobStatus
 
 
 class JobCreateRequest(BaseModel):
-    upload_id: str = Field(..., min_length=1)
+    upload_id: str | None = None
     prompt: str = Field(..., min_length=1, max_length=4000)
+    engine: str = Field(default="bulkcut", pattern="^(bulkcut|creatomate)$")
+    template_id: str | None = Field(default=None, max_length=64)
+    creatomate_mode: str = Field(default="edit", pattern="^(edit|template|source)$")
+    video_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Optional public video URL for Creatomate Video modification",
+    )
 
 
 class JobItemResponse(BaseModel):
@@ -20,6 +28,9 @@ class JobItemResponse(BaseModel):
     status: ItemStatus
     progress: float
     error: str | None = None
+    occurrences_replaced: int | None = None
+    preview_before_url: str | None = None
+    preview_after_url: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
@@ -32,6 +43,7 @@ class JobResponse(BaseModel):
     prompt: str
     instructions_json: str | None = None
     upload_id: str
+    engine: str = "bulkcut"
     error: str | None = None
     progress: float = 0.0
     items: list[JobItemResponse] = Field(default_factory=list)
@@ -44,3 +56,4 @@ class JobResponse(BaseModel):
 class JobCreateResponse(BaseModel):
     id: str
     status: JobStatus
+    engine: str = "bulkcut"

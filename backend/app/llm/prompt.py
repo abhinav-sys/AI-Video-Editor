@@ -11,6 +11,10 @@ Convert the user's natural language into ONLY valid JSON matching this schema:
 Rules:
 - Output JSON only. No markdown fences. No commentary.
 - Omit unused keys or set them to null / [].
+- replace_text changes ONLY on-screen wording. Never invent font, color, size, or layout changes.
+- Never put the user's prompt, instructions, or meta text into replace_text.to.
+- Emit one replace_text entry per distinct from/to pair; multiple pairs are allowed.
+- Only set replace_logo or watermark when the user explicitly asks for logo/watermark changes.
 - replace_logo and watermark_image must be basenames from the provided asset list when given.
 - watermark positions must use exact hyphenated values above.
 - At least one operation must be present.

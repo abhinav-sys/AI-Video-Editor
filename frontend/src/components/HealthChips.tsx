@@ -46,6 +46,12 @@ export function HealthChips({ health, error }: Props) {
         label={`LLM · ${health.llm_provider}`}
         state={health.llm_ok ? "ok" : "warn"}
       />
+      <Chip
+        label="Creatomate"
+        state={
+          !health.creatomate ? "idle" : health.creatomate_ok ? "ok" : "bad"
+        }
+      />
     </div>
   );
 }

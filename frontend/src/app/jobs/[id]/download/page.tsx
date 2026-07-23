@@ -40,6 +40,10 @@ export default function DownloadPage() {
               Job <code>{job.id}</code> · {readyCount} file{readyCount === 1 ? "" : "s"} ready
             </p>
             <DownloadButton jobId={job.id} ready={job.download_ready} />
+            <p className="meta" style={{ marginTop: "1rem" }}>
+              Before/after preview frames are on the{" "}
+              <Link href={`/jobs/${params.id}`}>progress page</Link>.
+            </p>
           </>
         )}
       </section>

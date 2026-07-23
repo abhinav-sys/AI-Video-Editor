@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.api.schemas.edits import EditInstructions
 from app.api.schemas.jobs import JobItemResponse, JobResponse
 from app.core.logging import get_logger
-from app.core.models import Asset, AssetKind, ItemStatus, Job, JobItem, JobStatus, UploadBatch
+from app.core.models import Asset, AssetKind, ItemStatus, Job, JobItem, JobStatus, RenderEngine, UploadBatch
 from app.services.storage import StorageService
 
 logger = get_logger(__name__)
@@ -24,6 +24,8 @@ class JobService:
         upload_id: str,
         prompt: str,
         instructions: EditInstructions,
+        *,
+        engine: str = RenderEngine.bulkcut.value,
     ) -> Job:
         batch = self.db.get(UploadBatch, upload_id)
         if batch is None:
@@ -56,6 +58,7 @@ class JobService:
             prompt=prompt,
             instructions_json=instructions.model_dump_json(by_alias=True),
             upload_id=upload_id,
+            engine=engine,
         )
         self.db.add(job)
         self.db.flush()
@@ -81,7 +84,86 @@ class JobService:
 
         self.db.commit()
         self.db.refresh(job)
-        logger.info("Created job %s with %d videos", job.id, len(video_assets))
+        logger.info("Created job %s with %d videos (engine=%s)", job.id, len(video_assets), engine)
+        return job
+
+    def create_creatomate_job(
+        self,
+        prompt: str,
+        instructions_json: str,
+        *,
+        upload_id: str | None = None,
+        require_videos: bool = True,
+    ) -> Job:
+        """Create a Creatomate job. Edit mode requires uploaded videos."""
+        if upload_id:
+            batch = self.db.get(UploadBatch, upload_id)
+            if batch is None:
+                raise ValueError("Unknown upload_id")
+        else:
+            if require_videos:
+                raise ValueError("Upload a video first for Creatomate edit mode")
+            batch = UploadBatch()
+            self.db.add(batch)
+            self.db.flush()
+            upload_id = batch.id
+
+        video_assets = (
+            self.db.query(Asset)
+            .filter(Asset.upload_id == upload_id, Asset.kind == AssetKind.video)
+            .all()
+        )
+        if require_videos and not video_assets:
+            raise ValueError("Upload has no videos — Creatomate edit needs a source clip")
+
+        job = Job(
+            status=JobStatus.queued,
+            prompt=prompt,
+            instructions_json=instructions_json,
+            upload_id=upload_id,
+            engine=RenderEngine.creatomate.value,
+        )
+        self.db.add(job)
+        self.db.flush()
+
+        for asset in self.db.query(Asset).filter(Asset.upload_id == upload_id).all():
+            asset.job_id = job.id
+
+        out_dir = self.storage.output_dir(job.id)
+        if video_assets:
+            for video in video_assets:
+                stem = Path(video.filename).stem
+                out_path = out_dir / f"{stem}_creatomate.mp4"
+                self.db.add(
+                    JobItem(
+                        job_id=job.id,
+                        input_path=video.path,
+                        output_path=str(out_path),
+                        original_filename=video.filename,
+                        status=ItemStatus.pending,
+                        progress=0.0,
+                    )
+                )
+        else:
+            out_path = out_dir / "creatomate_render.mp4"
+            self.db.add(
+                JobItem(
+                    job_id=job.id,
+                    input_path="creatomate://direct",
+                    output_path=str(out_path),
+                    original_filename="creatomate_render.mp4",
+                    status=ItemStatus.pending,
+                    progress=0.0,
+                )
+            )
+
+        self.db.commit()
+        self.db.refresh(job)
+        logger.info(
+            "Created Creatomate job %s (%d video source(s))",
+            job.id,
+            len(video_assets),
+        )
         return job
 
     def get_job(self, job_id: str) -> Job | None:
@@ -93,7 +175,30 @@ class JobService:
         )
 
     def to_response(self, job: Job) -> JobResponse:
-        items = [JobItemResponse.model_validate(i) for i in job.items]
+        items: list[JobItemResponse] = []
+        for i in job.items:
+            items.append(
+                JobItemResponse(
+                    id=i.id,
+                    original_filename=i.original_filename,
+                    status=i.status,
+                    progress=i.progress,
+                    error=i.error,
+                    occurrences_replaced=i.occurrences_replaced,
+                    preview_before_url=(
+                        f"/jobs/{job.id}/items/{i.id}/preview/before"
+                        if i.preview_before_path
+                        else None
+                    ),
+                    preview_after_url=(
+                        f"/jobs/{job.id}/items/{i.id}/preview/after"
+                        if i.preview_after_path
+                        else None
+                    ),
+                    started_at=i.started_at,
+                    finished_at=i.finished_at,
+                )
+            )
         progress = 0.0
         if items:
             progress = sum(i.progress for i in items) / len(items)
@@ -103,6 +208,7 @@ class JobService:
             prompt=job.prompt,
             instructions_json=job.instructions_json,
             upload_id=job.upload_id,
+            engine=getattr(job, "engine", RenderEngine.bulkcut.value) or RenderEngine.bulkcut.value,
             error=job.error,
             progress=round(progress, 2),
             items=items,

@@ -10,7 +10,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-from app.api.routes import downloads, health, jobs, uploads
+from app.api.routes import creatomate, downloads, health, jobs, public_media, uploads
 from app.config import get_settings
 from app.core.logging import setup_logging, get_logger
 from app.services.storage import StorageService
@@ -59,6 +59,8 @@ def create_app() -> FastAPI:
     app.include_router(uploads.router)
     app.include_router(jobs.router)
     app.include_router(downloads.router)
+    app.include_router(creatomate.router)
+    app.include_router(public_media.router)
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):  # noqa: ARG001

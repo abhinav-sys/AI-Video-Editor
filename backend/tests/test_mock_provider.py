@@ -20,3 +20,23 @@ async def test_parse_replace_with():
     inst = await provider.parse_prompt("Replace July with August")
     assert inst.replace_text[0].from_ == "July"
     assert inst.replace_text[0].to == "August"
+
+
+@pytest.mark.asyncio
+async def test_parse_multi_pair():
+    provider = MockProvider()
+    inst = await provider.parse_prompt(
+        "Replace Sydney to Melbourne, replace 15 & 16 august to 15 & 16 july"
+    )
+    assert len(inst.replace_text) == 2
+    assert inst.replace_text[0].from_ == "Sydney"
+    assert inst.replace_text[0].to == "Melbourne"
+    assert "august" in inst.replace_text[1].from_.lower()
+    assert "july" in inst.replace_text[1].to.lower()
+
+
+@pytest.mark.asyncio
+async def test_parse_rejects_prompt_as_banner():
+    provider = MockProvider()
+    with pytest.raises(ValueError, match="Could not parse"):
+        await provider.parse_prompt("make it look nicer somehow")

@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     ffprobe_path: str = "ffprobe"
     ffmpeg_fontfile: str = ""  # optional absolute path; helps drawtext on Windows
 
+    creatomate_api_key: str = ""
+    creatomate_default_template_id: str = ""
+    creatomate_api_base: str = "https://api.creatomate.com/v1"
+    creatomate_poll_interval_sec: float = 2.0
+    creatomate_poll_timeout_sec: float = 300.0
+    # Optional public origin (ngrok/cloudflare) so Creatomate can fetch local uploads
+    public_base_url: str = ""
+
     worker_poll_interval_sec: float = 1.0
     soft_retry_count: int = 1
 

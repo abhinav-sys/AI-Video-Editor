@@ -10,6 +10,10 @@ export type UploadResponse = {
   assets: UploadedFileInfo[];
 };
 
+export type RenderEngine = "bulkcut" | "creatomate";
+
+export type CreatomateMode = "edit" | "template" | "source";
+
 export type JobStatus =
   | "queued"
   | "parsing"
@@ -31,6 +35,9 @@ export type JobItemResponse = {
   status: ItemStatus;
   progress: number;
   error: string | null;
+  occurrences_replaced: number | null;
+  preview_before_url: string | null;
+  preview_after_url: string | null;
   started_at: string | null;
   finished_at: string | null;
 };
@@ -41,6 +48,7 @@ export type JobResponse = {
   prompt: string;
   instructions_json: string | null;
   upload_id: string;
+  engine: RenderEngine | string;
   error: string | null;
   progress: number;
   items: JobItemResponse[];
@@ -53,6 +61,7 @@ export type JobResponse = {
 export type JobCreateResponse = {
   id: string;
   status: JobStatus;
+  engine: RenderEngine | string;
 };
 
 export type HealthResponse = {
@@ -62,4 +71,20 @@ export type HealthResponse = {
   llm_ok: boolean;
   model: string;
   max_concurrent_renders: number;
+  creatomate?: boolean;
+  creatomate_ok?: boolean;
+  creatomate_template_id?: string | null;
+};
+
+export type CreatomateTemplate = {
+  id: string;
+  name: string;
+  tags: string[];
+  updated_at?: string;
+};
+
+export type CreatomateTemplatesResponse = {
+  configured: boolean;
+  default_template_id: string | null;
+  templates: CreatomateTemplate[];
 };

@@ -5,7 +5,8 @@ import asyncio
 from app.config import get_settings
 from app.core.db import SessionLocal
 from app.core.logging import get_logger
-from app.core.models import Job, JobStatus
+from app.core.models import Job, JobStatus, RenderEngine
+from app.workers.creatomate_pipeline import CreatomatePipeline
 from app.workers.pipeline import RenderPipeline
 
 logger = get_logger(__name__)
@@ -15,6 +16,7 @@ class JobWorker:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.pipeline = RenderPipeline()
+        self.creatomate_pipeline = CreatomatePipeline()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._active: set[str] = set()
@@ -36,11 +38,12 @@ class JobWorker:
     async def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                job_id = self._claim()
-                if job_id:
+                claimed = self._claim()
+                if claimed:
+                    job_id, engine = claimed
                     if job_id not in self._active:
                         self._active.add(job_id)
-                        asyncio.create_task(self._run_job(job_id))
+                        asyncio.create_task(self._run_job(job_id, engine))
                 else:
                     try:
                         await asyncio.wait_for(
@@ -53,7 +56,7 @@ class JobWorker:
                 logger.exception("Worker loop error")
                 await asyncio.sleep(2)
 
-    def _claim(self) -> str | None:
+    def _claim(self) -> tuple[str, str] | None:
         db = SessionLocal()
         try:
             job = (
@@ -64,15 +67,19 @@ class JobWorker:
             )
             if job is None:
                 return None
+            engine = getattr(job, "engine", None) or RenderEngine.bulkcut.value
             job.status = JobStatus.running
             db.commit()
-            return job.id
+            return job.id, engine
         finally:
             db.close()
 
-    async def _run_job(self, job_id: str) -> None:
+    async def _run_job(self, job_id: str, engine: str) -> None:
         try:
-            await self.pipeline.process_job(job_id)
+            if engine == RenderEngine.creatomate.value:
+                await self.creatomate_pipeline.process_job(job_id)
+            else:
+                await self.pipeline.process_job(job_id)
         finally:
             self._active.discard(job_id)
 

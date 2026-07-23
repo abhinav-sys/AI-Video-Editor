@@ -60,7 +60,13 @@ export default function JobPage() {
           Rendering
         </h1>
         <p className="lede">
-          Progress updates live. Cancel anytime while items are still queued or running.
+          {job?.status === "failed"
+            ? "Render failed — see the item error below."
+            : job?.engine === "creatomate" && (job.progress ?? 0) < 25
+              ? "OCR is locating text on your clip before Creatomate renders. Cancel anytime."
+              : job?.engine === "creatomate"
+                ? "Creatomate cloud render in progress. Cancel anytime while items are still queued or running."
+                : "Progress updates live. Cancel anytime while items are still queued or running."}
         </p>
       </header>
 

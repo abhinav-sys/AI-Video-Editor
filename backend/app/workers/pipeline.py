@@ -137,21 +137,37 @@ class RenderPipeline:
                     finally:
                         pdb.close()
 
-                await self.ffmpeg.render(
+                preview_dir = self.storage.output_dir(job_id) / "previews" / item_id
+                result = await self.ffmpeg.render(
                     input_path=input_path,
                     output_path=output_path,
                     instructions=instructions,
                     upload_id=upload_id,
                     progress_cb=on_progress,
+                    preview_dir=preview_dir,
                 )
 
                 item = db.get(JobItem, item_id)
                 assert item is not None
                 item.status = ItemStatus.completed
                 item.progress = 100.0
+                item.occurrences_replaced = result.occurrences
+                item.preview_before_path = (
+                    str(result.preview_before) if result.preview_before else None
+                )
+                item.preview_after_path = (
+                    str(result.preview_after) if result.preview_after else None
+                )
+                if result.occurrences:
+                    item.error = None
                 item.finished_at = datetime.now(timezone.utc)
                 db.commit()
-                logger.info("Item %s completed (attempt %d)", item_id, attempt)
+                logger.info(
+                    "Item %s completed (attempt %d, %d occurrence(s))",
+                    item_id,
+                    attempt,
+                    result.occurrences,
+                )
                 return
             except Exception as exc:
                 logger.warning("Item %s attempt %d failed: %s", item_id, attempt, exc)

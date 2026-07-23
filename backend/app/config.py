@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     enable_vision_detect: bool = True
     max_shots_sampled: int = 12
     hwaccel: str = ""  # empty | nvenc | qsv
+    # Fast local testing: trim source to first N seconds (0 = off).
+    test_clip_seconds: float = 0.0
+    # Stop after EditableTemplate + preview stills (skip video inpaint + final encode).
+    template_only: bool = False
 
     @property
     def cors_origin_list(self) -> list[str]:

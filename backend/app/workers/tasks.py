@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import threading
 from datetime import datetime, timezone
 
+from app.config import get_settings
 from app.core.db import SessionLocal
 from app.core.logging import get_logger
 from app.core.models import Job, JobStatus, RenderEngine
@@ -46,11 +48,38 @@ def _claim_for_celery(job_id: str) -> str | None:
         db.close()
 
 
+def _heartbeat_loop(job_id: str, stop: threading.Event, lease_seconds: float) -> None:
+    """Refresh heartbeat_at while the job stays running (mirrors runner._beat)."""
+    interval = max(10.0, lease_seconds / 3.0)
+    while not stop.wait(interval):
+        db = SessionLocal()
+        try:
+            job = db.get(Job, job_id)
+            if job is None or job.status != JobStatus.running:
+                return
+            job.heartbeat_at = datetime.now(timezone.utc)
+            db.commit()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Celery heartbeat failed for %s: %s", job_id, exc)
+        finally:
+            db.close()
+
+
 def _run_job_body(job_id: str) -> str:
     engine = _claim_for_celery(job_id)
     if engine is None:
         logger.info("Celery skip job %s (not claimable)", job_id)
         return "skipped"
+
+    stop = threading.Event()
+    lease = float(get_settings().job_lease_seconds)
+    beat = threading.Thread(
+        target=_heartbeat_loop,
+        args=(job_id, stop, lease),
+        name=f"celery-hb-{job_id[:8]}",
+        daemon=True,
+    )
+    beat.start()
     try:
         if engine == RenderEngine.creatomate.value:
             asyncio.run(CreatomatePipeline().process_job(job_id))
@@ -70,6 +99,9 @@ def _run_job_body(job_id: str) -> str:
         finally:
             db.close()
         raise
+    finally:
+        stop.set()
+        beat.join(timeout=max(2.0, lease / 3.0))
 
 
 if celery_app is not None:

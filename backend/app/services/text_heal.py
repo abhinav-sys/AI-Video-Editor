@@ -315,6 +315,26 @@ def heal_region_to_rgba_patch(
         )
 
     healed_rgb, mode = heal_crop(crop, mask)
+    # Prefer Phase-4 inpaint_service for static banner/flat when not forced.
+    if getattr(region, "heal_mode", None) != "inpaint":
+        try:
+            from app.services.inpaint_service import inpaint_region
+
+            result = inpaint_region(crop)
+            healed_rgb = result.image
+            mode = result.mode
+            if mode in ("telea", "lama"):
+                mode = "inpaint"
+            elif mode == "flat":
+                mode = "flat"
+            elif mode != "banner":
+                mode = "banner"
+        except Exception as exc:
+            logger.debug("inpaint_service unavailable (%s); using heal_crop", exc)
+
+    if getattr(region, "heal_mode", None) == "inpaint":
+        mode = "inpaint"
+
     # Capture plate/banner fill from the *tight* glyph mask before dilation expands
     # away all clean bg samples (otherwise fill collapses to dark seam colors).
     plate_fill = _plate_fill_color(crop, mask) if mode == "flat" else None
@@ -423,7 +443,7 @@ def write_heal_artifacts(
             )
             # Flat plates + live video both need per-frame heal: static fill from one
             # heal_source stamps the wrong color onto other scenes.
-            if mode in ("inpaint", "flat"):
+            if mode in ("inpaint", "flat") or getattr(region, "heal_mode", None) == "inpaint":
                 has_inpaint = True
                 # Rebuild a binary glyph mask on the crop for removelogo (not opaque flat rect)
                 crop = frame.crop((x, y, min(fw, x + rgba.size[0]), min(fh, y + rgba.size[1])))
@@ -442,6 +462,17 @@ def write_heal_artifacts(
                     removelogo[y:y1, x:x1] = np.maximum(
                         removelogo[y:y1, x:x1],
                         (gmask[:ah, :aw] >= 128).astype(np.uint8) * 255,
+                    )
+                # Moving text: also paint padded region bbox so motion isn't missed
+                if getattr(region, "heal_mode", None) == "inpaint":
+                    bp = 6
+                    by0 = max(0, region.y - bp)
+                    bx0 = max(0, region.x - bp)
+                    by1 = min(fh, region.y + region.h + bp)
+                    bx1 = min(fw, region.x + region.w + bp)
+                    removelogo[by0:by1, bx0:bx1] = np.maximum(
+                        removelogo[by0:by1, bx0:bx1],
+                        255,
                     )
                 # Force patch mode so FFmpeg skips static overlay for this region
                 patches[-1] = HealedPatch(

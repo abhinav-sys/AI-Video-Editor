@@ -71,6 +71,8 @@ class RenderRegion:
     t_start: float | None = None
     t_end: float | None = None
     entity_id: str | None = None
+    # When "inpaint", write_heal_artifacts forces removelogo (moving / unstable text).
+    heal_mode: str | None = None
 
 
 def normalize_text(value: str) -> str:
@@ -273,8 +275,9 @@ def estimate_glyph_span(
     """
     Return (x, y, w, h, draw_text) covering only the matched glyphs.
 
-    draw_text is always `to` (surgical). Extends rightward slightly if `to`
-    is longer — never widens to a banner-wide band.
+    draw_text is usually `to` (surgical). Extends rightward slightly if `to`
+    is longer — never widens to a banner-wide band. Year/time suffixes stay
+    on original pixels (not redrawn).
     """
     y = max(0, box.y - pad)
     h = box.h + 2 * pad
@@ -294,6 +297,10 @@ def estimate_glyph_span(
         )
     )
 
+    digit_suffix = False
+    if char_range is not None:
+        digit_suffix = any(ch.isdigit() for ch in box.text[char_range[1] :])
+
     if whole or char_range is None:
         x = max(0, box.x - pad)
         w = box.w + 2 * pad
@@ -304,17 +311,29 @@ def estimate_glyph_span(
         end_frac = end / text_len
         # Bias left: proportional char widths under-cover bold first glyphs (S→SMelbourne)
         start_frac = max(0.0, start_frac - 0.04)
-        end_frac = min(1.0, end_frac + 0.03)
+        # When a year/time follows, do NOT bias end right — that eats \"2026\".
+        if digit_suffix:
+            end_frac = min(1.0, end_frac)
+        else:
+            end_frac = min(1.0, end_frac + 0.03)
         span_x = box.x + int(box.w * start_frac)
         span_w = max(8, int(box.w * (end_frac - start_frac)))
-        left_extra = pad + (6 if len(from_.strip()) <= 12 else 0)
+        # Only bias left when the match starts the OCR line — otherwise we eat
+        # the previous word (e.g. "in Sydney" → "ir Melbourne").
+        if start <= 1:
+            left_extra = pad + (6 if len(from_.strip()) <= 12 else 0)
+        else:
+            left_extra = max(2, pad // 2)
         x = max(0, span_x - left_extra)
         w = span_w + pad + left_extra
+        if digit_suffix:
+            # Hard stop before year glyphs; leave slack for heal pad
+            tight_end = box.x + int(box.w * (end / text_len))
+            w = min(w, max(8, tight_end - x - pad))
 
-    # If replacement is longer, extend right only (stay near the OCR box).
+    # If replacement is longer, extend right only when no digit suffix follows.
     needed = max(w, int(len(to) * max(8, fontsize) * 0.55))
-    if needed > w:
-        # Cap: OCR box right edge + 20% of box width slack, never > 55% frame
+    if needed > w and not digit_suffix:
         max_right = min(
             frame_w,
             box.x + box.w + max(24, int(box.w * 0.2)),
@@ -661,6 +680,11 @@ def build_render_regions(
             )
             # Never let style fontsize explode past the cover box
             fontsize = min(style.fontsize, max(12, int(h * 0.92)))
+            # Year/time suffixes stay on original pixels — shrink drawtext so it
+            # cannot overflow the surgical width into \"2026\".
+            if char_range is not None and any(ch.isdigit() for ch in box.text[char_range[1] :]):
+                while fontsize > 14 and int(len(draw_text) * fontsize * 0.60) > w:
+                    fontsize -= 1
             style = StyleSample(
                 fill_rgb=style.fill_rgb,
                 font_rgb=style.font_rgb,

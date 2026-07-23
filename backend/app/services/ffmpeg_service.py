@@ -6,7 +6,7 @@ import os
 import re
 import shlex
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -14,13 +14,25 @@ from app.api.schemas.edits import EditInstructions, WatermarkPosition
 from app.config import get_settings
 from app.core.logging import get_logger
 from app.services.ffmpeg_kit import enable_between
-from app.services.scene_detect import detect_shots, shot_sample_times
-from app.services.storage import StorageService
 from app.services.ocr_audit import audit_dir_for_job, write_audit_snapshot
-from app.services.text_heal import HealedPatch, inpaint_video_under_mask, write_heal_artifacts
+from app.services.scene_detect import (
+    crop_similarity,
+    detect_shots,
+    refine_presence_window,
+    shot_sample_times,
+)
+from app.services.storage import StorageService
+from app.services.text_heal import (
+    HealedPatch,
+    inpaint_video_under_mask,
+    paint_invisible_preview,
+    write_heal_artifacts,
+)
 from app.services.text_ocr import RenderRegion, ocr_best_regions_for_replacements
 from app.services.timeline_service import regions_to_template
+from app.services.tracking_service import Detection, track_detections
 from app.services.vision_service import detect_logos_and_graphics
+
 
 logger = get_logger(__name__)
 
@@ -177,6 +189,119 @@ class FFmpegService:
         except Exception:
             return None
 
+    async def _mark_moving_regions(
+        self,
+        input_path: Path,
+        regions: list[RenderRegion],
+        work_dir: Path,
+    ) -> list[RenderRegion]:
+        """Sample 3 frames per region; force removelogo when bbox IoU drops ≤ 0.9."""
+        if not regions:
+            return regions
+        out: list[RenderRegion] = []
+        for r in regions:
+            t0 = float(r.t_start if r.t_start is not None else 0.0)
+            t1 = float(r.t_end if r.t_end is not None else t0 + 1.0)
+            if t1 <= t0:
+                t1 = t0 + 0.5
+            span = t1 - t0
+            sample_ts = [t0 + span * f for f in (0.25, 0.5, 0.75)]
+            dets: list[Detection] = []
+            for fi, t in enumerate(sample_ts):
+                frame_path = work_dir / f"stab_{id(r)}_{fi}.png"
+                ok = await self._extract_frame(input_path, frame_path, at_seconds=t)
+                if not ok:
+                    continue
+                # Presence via crop similarity against the known bbox (no full OCR).
+                try:
+                    from PIL import Image as _PILImage
+
+                    im = _PILImage.open(frame_path).convert("RGB")
+                    pad = 8
+                    x0 = max(0, r.x - pad)
+                    y0 = max(0, r.y - pad)
+                    x1 = min(im.size[0], r.x + r.w + pad)
+                    y1 = min(im.size[1], r.y + r.h + pad)
+                    # Use original bbox as the detection when crop still matches itself
+                    # (static) — motion shows up as failed similarity vs the mid sample.
+                    dets.append(
+                        Detection(
+                            frame_idx=fi,
+                            t=t,
+                            bbox=(r.x, r.y, r.w, r.h),
+                            label=r.from_text or "",
+                            score=1.0,
+                        )
+                    )
+                    im.close()
+                except Exception:
+                    continue
+
+            if len(dets) < 2:
+                out.append(r)
+                continue
+
+            # Compare mid-frame crop to side-frame crops at the same bbox.
+            # If either side fails similarity, treat as moving/animating.
+            mid_path = work_dir / f"stab_{id(r)}_1.png"
+            side_paths = [work_dir / f"stab_{id(r)}_0.png", work_dir / f"stab_{id(r)}_2.png"]
+            moving = False
+            try:
+                from PIL import Image as _PILImage2
+
+                if mid_path.is_file():
+                    mid = _PILImage2.open(mid_path).convert("RGB")
+                    pad = 4
+                    box = (
+                        max(0, r.x - pad),
+                        max(0, r.y - pad),
+                        min(mid.size[0], r.x + r.w + pad),
+                        min(mid.size[1], r.y + r.h + pad),
+                    )
+                    ref = mid.crop(box)
+                    mid.close()
+                    for sp in side_paths:
+                        if not sp.is_file():
+                            moving = True
+                            break
+                        side = _PILImage2.open(sp).convert("RGB")
+                        probe = side.crop(
+                            (
+                                max(0, r.x - pad),
+                                max(0, r.y - pad),
+                                min(side.size[0], r.x + r.w + pad),
+                                min(side.size[1], r.y + r.h + pad),
+                            )
+                        )
+                        side.close()
+                        if not crop_similarity(ref, probe, threshold=0.9):
+                            moving = True
+                            break
+            except Exception:
+                moving = True
+
+            # Also run IoU tracker across detections (same bbox → IoU=1; if we
+            # later attach shifted boxes this catches motion).
+            tracks = track_detections(dets, iou_threshold=0.3)
+            if tracks:
+                bboxes = [d.bbox for d in tracks[0].detections]
+                for i in range(len(bboxes) - 1):
+                    from app.services.tracking_service import _iou
+
+                    if _iou(bboxes[i], bboxes[i + 1]) <= 0.9:
+                        moving = True
+                        break
+
+            if moving:
+                logger.info(
+                    "Region %r unstable across window — routing to per-frame removelogo",
+                    r.from_text,
+                )
+                out.append(dc_replace(r, heal_mode="inpaint"))
+            else:
+                out.append(r)
+        return out
+
     async def locate_text_regions(
         self,
         input_path: Path,
@@ -192,6 +317,8 @@ class FFmpegService:
         """
         duration = await self.probe_duration(input_path)
         max_shots = self.settings.max_shots_sampled
+        if float(self.settings.test_clip_seconds or 0.0) > 0:
+            max_shots = min(max_shots, 3)
         try:
             shots = await asyncio.to_thread(detect_shots, str(input_path))
         except Exception as exc:
@@ -203,7 +330,6 @@ class FFmpegService:
             samples = [(1.0, 0.0, float(duration or 10.0))]
 
         candidates = [s[0] for s in samples]
-        shot_windows = [(s[1], s[2]) for s in samples]
         sample_at = candidates[0]
         preview_before: Path | None = None
 
@@ -218,11 +344,6 @@ class FFmpegService:
                     await progress_cb(min(18.0, pct))
             if not frame_paths:
                 raise RuntimeError("Failed to extract sample frames for OCR")
-
-            # Align windows to successfully extracted frames
-            windows_for_frames = shot_windows[: len(frame_paths)]
-            while len(windows_for_frames) < len(frame_paths):
-                windows_for_frames.append(shot_windows[-1] if shot_windows else (0.0, float(duration or 10.0)))
 
             if progress_cb:
                 await progress_cb(19.0)
@@ -253,22 +374,127 @@ class FFmpegService:
                     )
                 raise
 
-            # Stamp shot windows onto regions (best-frame window, or union of all shots)
+            # Per-region presence windows (not one shared shot window).
+            # Hint time: best_frame sample, else mid of first shot window.
             if best_frame is not None:
                 try:
-                    idx = frame_paths.index(best_frame)
-                    t0, t1 = windows_for_frames[idx]
+                    hint_idx = frame_paths.index(best_frame)
+                    hint_t = candidates[hint_idx]
                 except ValueError:
-                    t0, t1 = windows_for_frames[0]
+                    hint_t = candidates[0] if candidates else 1.0
             else:
-                t0 = min(w[0] for w in windows_for_frames)
-                t1 = max(w[1] for w in windows_for_frames)
+                hint_t = candidates[0] if candidates else 1.0
 
-            # If only one shot covers whole video, keep that; otherwise prefer
-            # union of shots where the matched text appeared (approximate: best frame shot).
-            stamped: list[RenderRegion] = []
+            dur = float(duration or 10.0)
+            refined: list[RenderRegion] = []
             for r in text_regions:
-                stamped.append(
+                # Prefer the region's own times if already set (e.g. template re-render)
+                if r.t_start is not None and r.t_end is not None and r.t_end > r.t_start:
+                    refined.append(r)
+                    continue
+
+                # Reference crop from best available sample frame
+                ref_frame_path = best_frame or frame_paths[0]
+                try:
+                    from PIL import Image as _PILImage
+
+                    ref_im = _PILImage.open(ref_frame_path).convert("RGB")
+                    pad = 4
+                    x0 = max(0, r.x - pad)
+                    y0 = max(0, r.y - pad)
+                    x1 = min(ref_im.size[0], r.x + r.w + pad)
+                    y1 = min(ref_im.size[1], r.y + r.h + pad)
+                    ref_crop = ref_im.crop((x0, y0, x1, y1))
+                    ref_im.close()
+                except Exception:
+                    refined.append(
+                        RenderRegion(
+                            x=r.x,
+                            y=r.y,
+                            w=r.w,
+                            h=r.h,
+                            fill_rgb=r.fill_rgb,
+                            font_rgb=r.font_rgb,
+                            fontsize=r.fontsize,
+                            text=r.text,
+                            align=r.align,
+                            from_text=r.from_text,
+                            ocr_text=r.ocr_text,
+                            bold=r.bold,
+                            baseline_y=r.baseline_y,
+                            fontfile=r.fontfile,
+                            text_y=r.text_y,
+                            t_start=0.0,
+                            t_end=dur,
+                            entity_id=r.entity_id,
+                            heal_mode=r.heal_mode,
+                        )
+                    )
+                    continue
+
+                probe_cache: dict[float, bool] = {}
+                # OCR already matched on the hint frame — don't re-probe it
+                # (ffmpeg -ss re-seek can differ enough to fail crop_similarity).
+                probe_cache[round(hint_t, 3)] = True
+
+                def _is_present(t: float, _ref=ref_crop, _box=(x0, y0, x1, y1)) -> bool:
+                    key = round(t, 3)
+                    if key in probe_cache:
+                        return probe_cache[key]
+                    # Sync extract into tmp for presence probe
+                    probe_path = Path(tmp) / f"presence_{key:.3f}.png".replace(".", "_")
+                    ok = False
+                    try:
+                        import subprocess
+
+                        proc = subprocess.run(
+                            [
+                                self.settings.ffmpeg_path,
+                                "-y",
+                                "-ss",
+                                str(max(0.0, t)),
+                                "-i",
+                                str(input_path),
+                                "-frames:v",
+                                "1",
+                                "-update",
+                                "1",
+                                str(probe_path),
+                            ],
+                            capture_output=True,
+                            check=False,
+                        )
+                        ok = proc.returncode == 0 and probe_path.is_file()
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        probe_cache[key] = False
+                        return False
+                    try:
+                        from PIL import Image as _PILImage2
+
+                        im = _PILImage2.open(probe_path).convert("RGB")
+                        crop = im.crop(_box)
+                        im.close()
+                        # Lower threshold: B-roll behind static banners changes a lot
+                        present = crop_similarity(_ref, crop, threshold=0.35)
+                    except Exception:
+                        present = False
+                    probe_cache[key] = present
+                    return present
+
+                t0, t1 = refine_presence_window(hint_t, dur, _is_present, step=0.5, max_probes=12)
+                # Burned-in promo overlays often span most of the clip. If presence
+                # collapsed to a tiny window, prefer full duration over missing edits.
+                if (t1 - t0) < max(2.5, dur * 0.05):
+                    logger.warning(
+                        "Region %r presence window too tight [%.2f,%.2f]; using full duration",
+                        r.from_text,
+                        t0,
+                        t1,
+                    )
+                    t0, t1 = 0.0, dur
+                refined.append(
                     RenderRegion(
                         x=r.x,
                         y=r.y,
@@ -288,11 +514,19 @@ class FFmpegService:
                         t_start=t0,
                         t_end=t1,
                         entity_id=r.entity_id,
+                        heal_mode=r.heal_mode,
                     )
                 )
-            text_regions = stamped
+                logger.info(
+                    "Region %r presence window=[%.2f,%.2f] (hint=%.2f)",
+                    r.from_text,
+                    t0,
+                    t1,
+                    hint_t,
+                )
 
-            logger.info("OCR located %d text region(s) window=[%.2f,%.2f]", len(text_regions), t0, t1)
+            text_regions = refined
+            logger.info("OCR located %d text region(s) with per-region windows", len(text_regions))
 
             if preview_dir is not None:
                 preview_dir.mkdir(parents=True, exist_ok=True)
@@ -394,7 +628,8 @@ class FFmpegService:
         text_regions: list[RenderRegion] | None = None,
         healed_patches: list[HealedPatch] | None = None,
         removelogo_mask: Path | None = None,
-    ) -> tuple[list[str], str]:
+    ) -> tuple[list[str], str, str]:
+        """Build filter graph. Returns (extra_inputs, filter_str, final_label)."""
         inputs: list[str] = []
         filters: list[str] = []
         current = "[0:v]"
@@ -425,7 +660,8 @@ class FFmpegService:
                     continue
                 if not patch.path.is_file():
                     continue
-                inputs.extend(["-i", str(patch.path)])
+                # Explicit loop so 1-frame PNG overlays don't rely on eof_action defaults.
+                inputs.extend(["-loop", "1", "-i", str(patch.path)])
                 label = f"[hp{i}]"
                 en = enable_between(
                     getattr(patch, "t_start", None),
@@ -493,9 +729,146 @@ class FFmpegService:
                 current = label
 
         if not filters:
-            return inputs, ""
+            return inputs, "", "0:v"
 
-        return inputs, ";".join(filters)
+        # Strip brackets for -map (FFmpeg wants 0:v or t0, not [t0] in some forms;
+        # we keep bracketed label for -map which accepts [label]).
+        final_label = current.strip()
+        if not final_label.startswith("["):
+            final_label = f"[{final_label}]"
+        return inputs, ";".join(filters), final_label
+
+    async def _maybe_trim_test_clip(self, input_path: Path, work_dir: Path) -> Path:
+        """When TEST_CLIP_SECONDS > 0, trim to the first N seconds and return that path."""
+        n = float(self.settings.test_clip_seconds or 0.0)
+        if n <= 0:
+            return input_path
+        work_dir.mkdir(parents=True, exist_ok=True)
+        out = work_dir / "test_clip.mp4"
+        logger.info("TEST_CLIP_SECONDS=%s — working on first %.1fs only", n, n)
+
+        async def _run(cmd: list[str]) -> bool:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not out.is_file() or out.stat().st_size < 64:
+                logger.warning(
+                    "test clip trim failed (code=%s): %s",
+                    proc.returncode,
+                    (stderr or b"").decode(errors="ignore")[-400:],
+                )
+                if out.is_file():
+                    try:
+                        out.unlink()
+                    except OSError:
+                        pass
+                return False
+            return True
+
+        copy_cmd = [
+            self.settings.ffmpeg_path,
+            "-y",
+            "-ss",
+            "0",
+            "-t",
+            str(n),
+            "-i",
+            str(input_path),
+            "-c",
+            "copy",
+            str(out),
+        ]
+        if await _run(copy_cmd):
+            return out
+
+        reenc_cmd = [
+            self.settings.ffmpeg_path,
+            "-y",
+            "-ss",
+            "0",
+            "-t",
+            str(n),
+            "-i",
+            str(input_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(out),
+        ]
+        if await _run(reenc_cmd):
+            return out
+        logger.warning("TEST_CLIP_SECONDS trim failed; continuing with full input")
+        return input_path
+
+    async def _build_template_json(
+        self,
+        *,
+        resolved_regions: list[RenderRegion],
+        input_path: Path,
+        duration: float | None,
+        preview_before: Path | None,
+        healed_patches: list[HealedPatch],
+        preview_dir: Path | None,
+    ) -> str | None:
+        if not resolved_regions:
+            return None
+        size = await self.probe_video_size(input_path)
+        width, height = size if size else (1080, 1920)
+        dur = float(duration or 10.0)
+        logo_ents = []
+        if preview_before and preview_before.is_file():
+            try:
+                t0 = min((r.t_start or 0.0) for r in resolved_regions)
+                t1 = max((r.t_end or dur) for r in resolved_regions)
+                logo_ents = await asyncio.to_thread(
+                    detect_logos_and_graphics,
+                    preview_before,
+                    t_start=t0,
+                    t_end=t1,
+                )
+            except Exception as exc:
+                logger.info("Vision detect skipped: %s", exc)
+        template = regions_to_template(
+            resolved_regions,
+            duration=dur,
+            width=width,
+            height=height,
+            logo_entities=logo_ents or None,
+        )
+        mode_by_text = {p.from_text: p.mode for p in healed_patches}
+        ents = []
+        for ent in template.entities:
+            if ent.text and ent.text in mode_by_text:
+                ents.append(ent.model_copy(update={"inpaint_mode": mode_by_text.get(ent.text)}))
+            else:
+                matched_mode = None
+                for r in resolved_regions:
+                    if r.entity_id == ent.id or r.text == ent.text:
+                        matched_mode = "flat"
+                        break
+                for p in healed_patches:
+                    if p.text == ent.text or p.from_text:
+                        matched_mode = "lama" if p.mode == "inpaint" else p.mode
+                        break
+                ents.append(
+                    ent.model_copy(update={"inpaint_mode": matched_mode or ent.inpaint_mode})
+                )
+        template = template.model_copy(update={"entities": ents})
+        template_json = template.model_dump_json()
+        if preview_dir is not None:
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            (preview_dir / "template.json").write_text(template_json, encoding="utf-8")
+        return template_json
 
     async def render(
         self,
@@ -527,6 +900,9 @@ class FFmpegService:
         resolved_regions: list[RenderRegion] = list(text_regions or [])
         heal_source: Path | None = None
 
+        work_dir = preview_dir or output_path.parent
+        input_path = await self._maybe_trim_test_clip(input_path, work_dir)
+
         duration = await self.probe_duration(input_path)
 
         if instructions.replace_text and not resolved_regions:
@@ -546,18 +922,29 @@ class FFmpegService:
         healed_patches: list[HealedPatch] = []
         removelogo_mask: Path | None = None
         if instructions.replace_text and resolved_regions:
+            # Skip motion forcing in short test clips — keep static banner heal.
+            if float(self.settings.test_clip_seconds or 0.0) <= 0:
+                stab_dir = work_dir / "heal_stab"
+                stab_dir.mkdir(parents=True, exist_ok=True)
+                resolved_regions = await self._mark_moving_regions(
+                    input_path, resolved_regions, stab_dir
+                )
             if heal_source is None or not heal_source.is_file():
-                heal_dir = preview_dir or output_path.parent
+                heal_dir = work_dir
                 heal_dir.mkdir(parents=True, exist_ok=True)
                 heal_source = heal_dir / "heal_source.png"
-                ok = await self._extract_frame(
-                    input_path, heal_source, at_seconds=sample_at_for_preview
-                )
+                # Prefer mid-window of first region when available
+                at = sample_at_for_preview
+                if resolved_regions:
+                    r0 = resolved_regions[0]
+                    if r0.t_start is not None and r0.t_end is not None:
+                        at = (float(r0.t_start) + float(r0.t_end)) / 2.0
+                ok = await self._extract_frame(input_path, heal_source, at_seconds=at)
                 if not ok:
                     raise RuntimeError("Failed to extract frame for text heal")
                 if preview_before is None:
                     preview_before = heal_source
-            patch_dir = (preview_dir or output_path.parent) / "heal_patches"
+            patch_dir = work_dir / "heal_patches"
             healed_patches, removelogo_mask = await asyncio.to_thread(
                 write_heal_artifacts,
                 heal_source,
@@ -565,11 +952,57 @@ class FFmpegService:
                 patch_dir,
             )
 
+        # Persist EditableTemplate early (before expensive inpaint/encode).
+        template_json = await self._build_template_json(
+            resolved_regions=resolved_regions,
+            input_path=input_path,
+            duration=duration,
+            preview_before=preview_before,
+            healed_patches=healed_patches,
+            preview_dir=preview_dir,
+        )
+
+        if self.settings.template_only:
+            logger.info("TEMPLATE_ONLY=true — skipping video inpaint and final encode")
+            if preview_dir is not None:
+                preview_dir.mkdir(parents=True, exist_ok=True)
+                if preview_before is not None and preview_before.is_file():
+                    dest_before = preview_dir / "preview_before.png"
+                    if preview_before.resolve() != dest_before.resolve():
+                        try:
+                            from shutil import copy2
+
+                            copy2(preview_before, dest_before)
+                            preview_before = dest_before
+                        except OSError:
+                            pass
+                if (
+                    preview_before is not None
+                    and preview_before.is_file()
+                    and resolved_regions
+                ):
+                    preview_after = preview_dir / "preview_after.png"
+                    await asyncio.to_thread(
+                        paint_invisible_preview,
+                        preview_before,
+                        resolved_regions,
+                        preview_after,
+                        patches=healed_patches or None,
+                    )
+            if progress_cb:
+                await progress_cb(100.0)
+            return RenderResult(
+                occurrences=len(resolved_regions),
+                preview_before=preview_before if preview_before and preview_before.is_file() else None,
+                preview_after=preview_after if preview_after and preview_after.is_file() else None,
+                template_json=template_json,
+            )
+
         # Video-bg glyphs: per-frame OpenCV inpaint (avoids frozen/removelogo plates).
         # Banner glyphs stay as static soft-fill overlays in the filter graph.
         render_input = input_path
         if removelogo_mask is not None and removelogo_mask.is_file():
-            inpainted = (preview_dir or output_path.parent) / "video_inpainted.mp4"
+            inpainted = work_dir / "video_inpainted.mp4"
             await asyncio.to_thread(
                 inpaint_video_under_mask,
                 input_path,
@@ -577,12 +1010,12 @@ class FFmpegService:
                 inpainted,
             )
             # Attach original audio onto the OpenCV intermediate
-            muxed = (preview_dir or output_path.parent) / "video_inpainted_a.mp4"
+            muxed = work_dir / "video_inpainted_a.mp4"
             mux_ok = await self._mux_audio(inpainted, input_path, muxed)
             render_input = muxed if mux_ok else inpainted
             removelogo_mask = None  # already applied per-frame
 
-        extra_inputs, filter_complex = self.build_filter_complex(
+        extra_inputs, filter_complex, final_label = self.build_filter_complex(
             instructions,
             logo_path,
             watermark_path,
@@ -600,9 +1033,7 @@ class FFmpegService:
         ]
 
         if filter_complex:
-            last_label_match = re.findall(r"\[([^\]]+)\]", filter_complex)
-            map_label = f"[{last_label_match[-1]}]" if last_label_match else "[0:v]"
-            cmd.extend(["-filter_complex", filter_complex, "-map", map_label])
+            cmd.extend(["-filter_complex", filter_complex, "-map", final_label])
         else:
             cmd.extend(["-map", "0:v"])
 
@@ -623,8 +1054,12 @@ class FFmpegService:
                 "-c:v",
                 vcodec,
                 *vextra,
+                "-pix_fmt",
+                "yuv420p",
                 "-c:a",
                 "aac",
+                "-movflags",
+                "+faststart",
                 "-shortest",
                 str(output_path),
             ]
@@ -711,54 +1146,6 @@ class FFmpegService:
 
         if progress_cb:
             await progress_cb(100.0)
-
-        template_json: str | None = None
-        if resolved_regions:
-            size = await self.probe_video_size(input_path)
-            width, height = size if size else (1080, 1920)
-            dur = float(duration or 10.0)
-            logo_ents = []
-            if preview_before and preview_before.is_file():
-                try:
-                    t0 = min((r.t_start or 0.0) for r in resolved_regions)
-                    t1 = max((r.t_end or dur) for r in resolved_regions)
-                    logo_ents = await asyncio.to_thread(
-                        detect_logos_and_graphics,
-                        preview_before,
-                        t_start=t0,
-                        t_end=t1,
-                    )
-                except Exception as exc:
-                    logger.info("Vision detect skipped: %s", exc)
-            template = regions_to_template(
-                resolved_regions,
-                duration=dur,
-                width=width,
-                height=height,
-                logo_entities=logo_ents or None,
-            )
-            # Stamp inpaint mode from heal patches when available
-            mode_by_text = {p.from_text: p.mode for p in healed_patches}
-            ents = []
-            for ent in template.entities:
-                if ent.text and ent.text in mode_by_text:
-                    ents.append(ent.model_copy(update={"inpaint_mode": mode_by_text.get(ent.text)}))
-                else:
-                    # match by from via regions
-                    matched_mode = None
-                    for r in resolved_regions:
-                        if r.entity_id == ent.id or r.text == ent.text:
-                            matched_mode = "flat"
-                            break
-                    for p in healed_patches:
-                        if p.text == ent.text or p.from_text:
-                            matched_mode = "lama" if p.mode == "inpaint" else p.mode
-                            break
-                    ents.append(ent.model_copy(update={"inpaint_mode": matched_mode or ent.inpaint_mode}))
-            template = template.model_copy(update={"entities": ents})
-            template_json = template.model_dump_json()
-            if preview_dir is not None:
-                (preview_dir / "template.json").write_text(template_json, encoding="utf-8")
 
         return RenderResult(
             occurrences=len(resolved_regions),

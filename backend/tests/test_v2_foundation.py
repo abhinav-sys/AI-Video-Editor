@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from app.api.schemas.template import EditableTemplate, EntityType, TrackSegment, TemplateEntity, VideoMeta, EntityStyle
 from app.services.ffmpeg_kit import enable_between
-from app.services.scene_detect import shot_sample_times
+from app.services.scene_detect import refine_presence_window, shot_sample_times
 from app.services.timeline_service import regions_to_template, template_to_regions
 from app.services.tracking_service import Detection, track_detections
 from app.services.text_ocr import RenderRegion
@@ -24,6 +24,26 @@ def test_shot_sample_times_caps():
     assert len(samples) == 5
     for sample_t, t0, t1 in samples:
         assert t0 <= sample_t <= t1
+
+
+def test_refine_presence_window_finds_bounds():
+    # Present only between 2.0 and 8.0
+    def is_present(t: float) -> bool:
+        return 2.0 <= t <= 8.0
+
+    t0, t1 = refine_presence_window(5.0, 12.0, is_present, step=0.5, max_probes=12)
+    assert t0 <= 2.5
+    assert t1 >= 7.5
+    assert t1 - t0 < 12.0  # not full duration
+
+
+def test_refine_presence_window_missed_hint():
+    def never(_: float) -> bool:
+        return False
+
+    t0, t1 = refine_presence_window(4.0, 10.0, never, step=0.5)
+    assert 3.0 <= t0 <= 4.0
+    assert 4.0 <= t1 <= 5.0
 
 
 def test_regions_to_template_roundtrip():

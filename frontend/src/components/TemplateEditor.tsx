@@ -112,10 +112,43 @@ export function TemplateEditor({ jobId, itemId, filename }: Props) {
           >
             <div className="meta">
               {ent.type} · {ent.role} · {ent.id}
-              {ent.track[0]
-                ? ` · ${ent.track[0].t_start.toFixed(1)}s–${ent.track[0].t_end.toFixed(1)}s`
-                : ""}
             </div>
+            {ent.track[0] && (
+              <div style={{ marginTop: "0.35rem", display: "flex", gap: "1rem", flexWrap: "wrap" }}>
+                <label style={{ display: "inline-block" }}>
+                  <span className="meta">t_start (s)</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min={0}
+                    value={ent.track[0].t_start}
+                    onChange={(e) => {
+                      const t_start = Number(e.target.value);
+                      const track = [...ent.track];
+                      track[0] = { ...track[0], t_start };
+                      updateEntity(ent.id, { track });
+                    }}
+                    style={{ width: "5rem", marginLeft: "0.35rem" }}
+                  />
+                </label>
+                <label style={{ display: "inline-block" }}>
+                  <span className="meta">t_end (s)</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min={0}
+                    value={ent.track[0].t_end}
+                    onChange={(e) => {
+                      const t_end = Number(e.target.value);
+                      const track = [...ent.track];
+                      track[0] = { ...track[0], t_end };
+                      updateEntity(ent.id, { track });
+                    }}
+                    style={{ width: "5rem", marginLeft: "0.35rem" }}
+                  />
+                </label>
+              </div>
+            )}
             {ent.type === "text" && (
               <label style={{ display: "block", marginTop: "0.35rem" }}>
                 <span className="meta">Text</span>

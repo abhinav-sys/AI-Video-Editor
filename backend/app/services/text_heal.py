@@ -33,6 +33,8 @@ class HealedPatch:
     mode: str  # "banner" | "inpaint"
     from_text: str
     text: str  # replacement to (for pairing with drawtext)
+    t_start: float | None = None
+    t_end: float | None = None
 
 
 def build_glyph_mask(
@@ -415,6 +417,8 @@ def write_heal_artifacts(
                     mode=mode,
                     from_text=region.from_text,
                     text=region.text,
+                    t_start=getattr(region, "t_start", None),
+                    t_end=getattr(region, "t_end", None),
                 )
             )
             # Flat plates + live video both need per-frame heal: static fill from one
@@ -449,6 +453,8 @@ def write_heal_artifacts(
                     mode="inpaint",
                     from_text=patches[-1].from_text,
                     text=patches[-1].text,
+                    t_start=patches[-1].t_start,
+                    t_end=patches[-1].t_end,
                 )
             logger.info(
                 "Healed patch %d mode=%s %dx%d at (%d,%d) for %r -> %r",

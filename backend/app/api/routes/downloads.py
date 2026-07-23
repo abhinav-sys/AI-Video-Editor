@@ -19,7 +19,7 @@ def download_job_zip(job_id: str, db: Session = Depends(get_db)) -> FileResponse
     job = service.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != JobStatus.completed or not job.zip_path:
+    if job.status not in (JobStatus.completed, JobStatus.partial) or not job.zip_path:
         raise HTTPException(status_code=409, detail="ZIP not ready")
     path = Path(job.zip_path)
     if not path.is_file():

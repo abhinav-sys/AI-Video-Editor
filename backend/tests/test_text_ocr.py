@@ -262,7 +262,8 @@ def test_ocr_best_unions_frames(tmp_path: Path):
     assert ys[1] > 700
 
 
-def test_ocr_best_fails_partial_short_after_retry(tmp_path: Path):
+def test_ocr_best_proceeds_partial_short_after_retry(tmp_path: Path):
+    """After boost, a single portrait short-token hit warns but still returns regions."""
     frame = tmp_path / "only.png"
     im = Image.new("RGB", (540, 960), (12, 40, 55))
     ImageDraw.Draw(im).rectangle((20, 800, 500, 840), fill=(10, 47, 66))
@@ -275,11 +276,17 @@ def test_ocr_best_fails_partial_short_after_retry(tmp_path: Path):
 
     pairs = [TextReplace.model_validate({"from": "Sydney", "to": "Melbourne"})]
 
-    with patch("app.services.text_ocr.read_ocr_boxes_robust", side_effect=fake_robust):
-        with pytest.raises(ValueError, match="1 place"):
-            ocr_best_regions_for_replacements(
-                [frame],
-                pairs,
-                use_boost=True,
-                enforce_multi_short=True,
-            )
+    with (
+        patch("app.services.text_ocr.read_ocr_boxes_robust", side_effect=fake_robust),
+        patch("app.services.text_ocr.read_ocr_boxes", side_effect=fake_robust),
+    ):
+        regions, best = ocr_best_regions_for_replacements(
+            [frame],
+            pairs,
+            use_boost=False,
+            enforce_multi_short=True,
+        )
+
+    assert best is not None
+    assert len(regions) == 1
+    assert "melbourne" in regions[0].text.lower()

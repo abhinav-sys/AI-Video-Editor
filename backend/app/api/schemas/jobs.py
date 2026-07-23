@@ -31,6 +31,7 @@ class JobItemResponse(BaseModel):
     occurrences_replaced: int | None = None
     preview_before_url: str | None = None
     preview_after_url: str | None = None
+    has_template: bool = False
     started_at: datetime | None = None
     finished_at: datetime | None = None
 

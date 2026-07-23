@@ -14,18 +14,19 @@ export type RenderEngine = "bulkcut" | "creatomate";
 
 export type CreatomateMode = "edit" | "template" | "source";
 
-export type JobStatus =
-  | "queued"
-  | "parsing"
+export type ItemStatus =
+  | "pending"
   | "running"
   | "completed"
   | "failed"
   | "cancelled";
 
-export type ItemStatus =
-  | "pending"
+export type JobStatus =
+  | "queued"
+  | "parsing"
   | "running"
   | "completed"
+  | "partial"
   | "failed"
   | "cancelled";
 
@@ -38,8 +39,42 @@ export type JobItemResponse = {
   occurrences_replaced: number | null;
   preview_before_url: string | null;
   preview_after_url: string | null;
+  has_template?: boolean;
   started_at: string | null;
   finished_at: string | null;
+};
+
+export type TrackSegment = {
+  t_start: number;
+  t_end: number;
+  bbox: number[];
+  opacity_curve?: string | null;
+};
+
+export type EntityStyle = {
+  font?: string | null;
+  size?: number | null;
+  color?: string | null;
+  fill?: string | null;
+  align?: string;
+  bold?: boolean;
+};
+
+export type TemplateEntity = {
+  id: string;
+  type: "text" | "logo" | "graphic";
+  role: string;
+  text?: string | null;
+  track: TrackSegment[];
+  style: EntityStyle;
+  asset_filename?: string | null;
+  inpaint_mode?: string | null;
+};
+
+export type EditableTemplate = {
+  video: { duration: number; width: number; height: number; fps: number };
+  entities: TemplateEntity[];
+  version: number;
 };
 
 export type JobResponse = {

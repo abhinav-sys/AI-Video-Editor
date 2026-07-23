@@ -1,10 +1,38 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vgai
+      POSTGRES_PASSWORD: vgai
+      POSTGRES_DB: vgai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vgai -d vgai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   backend:
     build: ./backend
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: sqlite:///./app.db
+      DATABASE_URL: postgresql+psycopg://vgai:vgai@postgres:5432/vgai
       STORAGE_ROOT: ./storage
       CORS_ORIGINS: http://localhost:3000
       API_KEY: ${API_KEY:-dev-api-key-change-me}
@@ -14,9 +42,49 @@ services:
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5}
       LLM_PROVIDER: ollama
       MAX_CONCURRENT_RENDERS: "2"
+      USE_INLINE_WORKER: "false"
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FONTS_DIR: /app/assets/fonts
     volumes:
       - backend_storage:/app/storage
-      - backend_db:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: >
+      sh -c "alembic upgrade head &&
+      celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=2"
+    environment:
+      DATABASE_URL: postgresql+psycopg://vgai:vgai@postgres:5432/vgai
+      STORAGE_ROOT: ./storage
+      API_KEY: ${API_KEY:-dev-api-key-change-me}
+      MAX_CONCURRENT_RENDERS: "2"
+      USE_INLINE_WORKER: "false"
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FONTS_DIR: /app/assets/fonts
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5}
+      LLM_PROVIDER: ollama
+    volumes:
+      - backend_storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -35,4 +103,4 @@ services:
 
 volumes:
   backend_storage:
-  backend_db:
+  postgres_data:

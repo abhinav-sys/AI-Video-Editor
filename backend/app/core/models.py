@@ -19,6 +19,7 @@ class JobStatus(str, enum.Enum):
     parsing = "parsing"
     running = "running"
     completed = "completed"
+    partial = "partial"  # some items ok, some failed
     failed = "failed"
     cancelled = "cancelled"
 
@@ -58,6 +59,9 @@ class Job(Base):
     upload_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     zip_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -96,6 +100,7 @@ class JobItem(Base):
     occurrences_replaced: Mapped[int | None] = mapped_column(Integer, nullable=True)
     preview_before_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     preview_after_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    template_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

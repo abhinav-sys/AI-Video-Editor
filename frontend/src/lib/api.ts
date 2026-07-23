@@ -295,12 +295,46 @@ export async function cancelJob(jobId: string): Promise<JobResponse> {
 
 
 export function downloadUrl(jobId: string): string {
-
   return `${API_URL}/jobs/${jobId}/download`;
-
 }
 
+export async function getItemTemplate(
+  jobId: string,
+  itemId: string
+): Promise<import("./types").EditableTemplate> {
+  const res = await request(`${API_URL}/jobs/${jobId}/items/${itemId}/template`, {
+    headers: headers(),
+  });
+  return handle(res);
+}
 
+export async function patchItemTemplate(
+  jobId: string,
+  itemId: string,
+  body: { entities: import("./types").TemplateEntity[] }
+): Promise<import("./types").EditableTemplate> {
+  const res = await request(`${API_URL}/jobs/${jobId}/items/${itemId}/template`, {
+    method: "PATCH",
+    headers: headers(true),
+    body: JSON.stringify(body),
+  });
+  return handle(res);
+}
+
+export async function rerenderFromTemplate(
+  jobId: string,
+  itemId: string
+): Promise<{ ok: boolean; output_path: string; occurrences: number }> {
+  const res = await request(
+    `${API_URL}/jobs/${jobId}/items/${itemId}/rerender`,
+    {
+      method: "POST",
+      headers: headers(),
+    },
+    600_000
+  );
+  return handle(res);
+}
 
 /** Absolute URL for an item preview path returned by the API (relative `/jobs/...`). */
 

@@ -80,27 +80,47 @@ def _top_percentile_rgb(
 
 @lru_cache(maxsize=1)
 def list_font_candidates() -> tuple[tuple[str, bool], ...]:
-    """(path, is_bold) pairs that exist on this machine."""
+    """(path, is_bold) pairs that exist on this machine. Bundled fonts first."""
+    from app.config import get_settings
+
+    named: list[tuple[str, bool]] = []
+    fonts_dir = get_settings().resolved_fonts_dir
+    if fonts_dir.is_dir():
+        named.extend(
+            [
+                (str(fonts_dir / "DejaVuSans.ttf"), False),
+                (str(fonts_dir / "DejaVuSans-Bold.ttf"), True),
+                (str(fonts_dir / "LiberationSans-Regular.ttf"), False),
+                (str(fonts_dir / "LiberationSans-Bold.ttf"), True),
+                (str(fonts_dir / "Arial.ttf"), False),
+                (str(fonts_dir / "arial.ttf"), False),
+                (str(fonts_dir / "arialbd.ttf"), True),
+            ]
+        )
+    named.extend(
+        [
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", False),
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", True),
+            ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", False),
+            ("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", True),
+            ("/System/Library/Fonts/Supplemental/Arial.ttf", False),
+            ("/System/Library/Fonts/Supplemental/Arial Bold.ttf", True),
+            ("/Library/Fonts/Arial.ttf", False),
+            ("/Library/Fonts/Arial Bold.ttf", True),
+        ]
+    )
     windir = os.environ.get("WINDIR")
     win_fonts = Path(windir) / "Fonts" if windir else Path(r"C:\Windows\Fonts")
-    named = [
-        (str(win_fonts / "arial.ttf"), False),
-        (str(win_fonts / "arialbd.ttf"), True),
-        (str(win_fonts / "segoeui.ttf"), False),
-        (str(win_fonts / "segoeuib.ttf"), True),
-        (str(win_fonts / "calibri.ttf"), False),
-        (str(win_fonts / "calibrib.ttf"), True),
-        (r"C:\Windows\Fonts\arial.ttf", False),
-        (r"C:\Windows\Fonts\arialbd.ttf", True),
-        ("/System/Library/Fonts/Supplemental/Arial.ttf", False),
-        ("/System/Library/Fonts/Supplemental/Arial Bold.ttf", True),
-        ("/Library/Fonts/Arial.ttf", False),
-        ("/Library/Fonts/Arial Bold.ttf", True),
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", False),
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", True),
-        ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", False),
-        ("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", True),
-    ]
+    named.extend(
+        [
+            (str(win_fonts / "arial.ttf"), False),
+            (str(win_fonts / "arialbd.ttf"), True),
+            (str(win_fonts / "segoeui.ttf"), False),
+            (str(win_fonts / "segoeuib.ttf"), True),
+            (str(win_fonts / "calibri.ttf"), False),
+            (str(win_fonts / "calibrib.ttf"), True),
+        ]
+    )
     seen: set[str] = set()
     out: list[tuple[str, bool]] = []
     for path, bold in named:

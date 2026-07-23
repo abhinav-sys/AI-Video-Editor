@@ -13,10 +13,14 @@ from pathlib import Path
 from app.api.schemas.edits import EditInstructions, WatermarkPosition
 from app.config import get_settings
 from app.core.logging import get_logger
+from app.services.ffmpeg_kit import enable_between
+from app.services.scene_detect import detect_shots, shot_sample_times
 from app.services.storage import StorageService
 from app.services.ocr_audit import audit_dir_for_job, write_audit_snapshot
 from app.services.text_heal import HealedPatch, inpaint_video_under_mask, write_heal_artifacts
 from app.services.text_ocr import RenderRegion, ocr_best_regions_for_replacements
+from app.services.timeline_service import regions_to_template
+from app.services.vision_service import detect_logos_and_graphics
 
 logger = get_logger(__name__)
 
@@ -34,39 +38,65 @@ class RenderResult:
     occurrences: int
     preview_before: Path | None
     preview_after: Path | None
+    template_json: str | None = None
 
 
 @lru_cache
 def detect_system_font(*, bold: bool = False) -> str | None:
-    """Find a usable TrueType font for FFmpeg drawtext on Windows/macOS/Linux."""
+    """Find a usable TrueType font for FFmpeg drawtext.
+
+    Prefers bundled FONTS_DIR /assets/fonts, then OS fonts.
+    """
+    settings = get_settings()
+    fonts_dir = settings.resolved_fonts_dir
+    bundled = []
+    if fonts_dir.is_dir():
+        if bold:
+            bundled = [
+                fonts_dir / "DejaVuSans-Bold.ttf",
+                fonts_dir / "LiberationSans-Bold.ttf",
+                fonts_dir / "Arial-Bold.ttf",
+                fonts_dir / "arialbd.ttf",
+            ]
+        else:
+            bundled = [
+                fonts_dir / "DejaVuSans.ttf",
+                fonts_dir / "LiberationSans-Regular.ttf",
+                fonts_dir / "Arial.ttf",
+                fonts_dir / "arial.ttf",
+            ]
+        for path in bundled:
+            if path.is_file():
+                return str(path)
+
     if bold:
         bold_candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
             r"C:\Windows\Fonts\arialbd.ttf",
             r"C:\Windows\Fonts\segoeuib.ttf",
             r"C:\Windows\Fonts\calibrib.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-            "/Library/Fonts/Arial Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         ]
         windir = os.environ.get("WINDIR")
         if windir:
-            bold_candidates.insert(0, str(Path(windir) / "Fonts" / "arialbd.ttf"))
+            bold_candidates.append(str(Path(windir) / "Fonts" / "arialbd.ttf"))
         for path in bold_candidates:
             if Path(path).is_file():
                 return path
     candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
         r"C:\Windows\Fonts\arial.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
         r"C:\Windows\Fonts\calibri.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     ]
     windir = os.environ.get("WINDIR")
     if windir:
-        candidates.insert(0, str(Path(windir) / "Fonts" / "arial.ttf"))
+        candidates.append(str(Path(windir) / "Fonts" / "arial.ttf"))
     for path in candidates:
         if Path(path).is_file():
             return path
@@ -155,19 +185,25 @@ class FFmpegService:
         preview_dir: Path | None = None,
         progress_cb=None,
     ) -> tuple[list[RenderRegion], Path | None, float]:
-        """OCR sample frames and return paint regions + optional before-preview.
+        """OCR sample frames (one per shot) and return paint regions + preview.
 
         Returns (regions, preview_before_path, sample_time_seconds).
+        Regions carry t_start/t_end from the shot where text was found.
         """
         duration = await self.probe_duration(input_path)
-        if duration and duration > 3:
-            # Extra late samples catch banners that fade in after the open.
-            candidates = [
-                min(max(duration * p, 0.5), max(duration - 0.5, 0.5))
-                for p in (0.15, 0.35, 0.55, 0.75)
-            ]
-        else:
-            candidates = [1.0]
+        max_shots = self.settings.max_shots_sampled
+        try:
+            shots = await asyncio.to_thread(detect_shots, str(input_path))
+        except Exception as exc:
+            logger.warning("detect_shots failed: %s", exc)
+            shots = [(0.0, float(duration or 10.0))]
+
+        samples = shot_sample_times(shots, max_shots=max_shots)
+        if not samples:
+            samples = [(1.0, 0.0, float(duration or 10.0))]
+
+        candidates = [s[0] for s in samples]
+        shot_windows = [(s[1], s[2]) for s in samples]
         sample_at = candidates[0]
         preview_before: Path | None = None
 
@@ -178,11 +214,15 @@ class FFmpegService:
                 if await self._extract_frame(input_path, frame_path, at_seconds=at):
                     frame_paths.append(frame_path)
                 if progress_cb:
-                    # 12% → ~20% while extracting / before heavy OCR
                     pct = 12.0 + (idx + 1) / max(1, len(candidates)) * 6.0
                     await progress_cb(min(18.0, pct))
             if not frame_paths:
                 raise RuntimeError("Failed to extract sample frames for OCR")
+
+            # Align windows to successfully extracted frames
+            windows_for_frames = shot_windows[: len(frame_paths)]
+            while len(windows_for_frames) < len(frame_paths):
+                windows_for_frames.append(shot_windows[-1] if shot_windows else (0.0, float(duration or 10.0)))
 
             if progress_cb:
                 await progress_cb(19.0)
@@ -197,7 +237,6 @@ class FFmpegService:
             except Exception as exc:
                 ocr_error = str(exc)
                 text_regions, best_frame = [], None
-                # Persist audit then re-raise so jobs still fail clearly
                 if preview_dir is not None:
                     preview_dir.mkdir(parents=True, exist_ok=True)
                     await asyncio.to_thread(
@@ -214,7 +253,46 @@ class FFmpegService:
                     )
                 raise
 
-            logger.info("OCR located %d text region(s)", len(text_regions))
+            # Stamp shot windows onto regions (best-frame window, or union of all shots)
+            if best_frame is not None:
+                try:
+                    idx = frame_paths.index(best_frame)
+                    t0, t1 = windows_for_frames[idx]
+                except ValueError:
+                    t0, t1 = windows_for_frames[0]
+            else:
+                t0 = min(w[0] for w in windows_for_frames)
+                t1 = max(w[1] for w in windows_for_frames)
+
+            # If only one shot covers whole video, keep that; otherwise prefer
+            # union of shots where the matched text appeared (approximate: best frame shot).
+            stamped: list[RenderRegion] = []
+            for r in text_regions:
+                stamped.append(
+                    RenderRegion(
+                        x=r.x,
+                        y=r.y,
+                        w=r.w,
+                        h=r.h,
+                        fill_rgb=r.fill_rgb,
+                        font_rgb=r.font_rgb,
+                        fontsize=r.fontsize,
+                        text=r.text,
+                        align=r.align,
+                        from_text=r.from_text,
+                        ocr_text=r.ocr_text,
+                        bold=r.bold,
+                        baseline_y=r.baseline_y,
+                        fontfile=r.fontfile,
+                        text_y=r.text_y,
+                        t_start=t0,
+                        t_end=t1,
+                        entity_id=r.entity_id,
+                    )
+                )
+            text_regions = stamped
+
+            logger.info("OCR located %d text region(s) window=[%.2f,%.2f]", len(text_regions), t0, t1)
 
             if preview_dir is not None:
                 preview_dir.mkdir(parents=True, exist_ok=True)
@@ -349,8 +427,12 @@ class FFmpegService:
                     continue
                 inputs.extend(["-i", str(patch.path)])
                 label = f"[hp{i}]"
+                en = enable_between(
+                    getattr(patch, "t_start", None),
+                    getattr(patch, "t_end", None),
+                )
                 filters.append(
-                    f"{current}[{input_index}:v]overlay={patch.x}:{patch.y}:format=auto{label}"
+                    f"{current}[{input_index}:v]overlay={patch.x}:{patch.y}:format=auto{en}{label}"
                 )
                 current = label
                 input_index += 1
@@ -371,15 +453,17 @@ class FFmpegService:
                     text_x = f"{region.x}+({region.w}-text_w)/2"
                 else:
                     text_x = str(region.x + 2)
+                en = enable_between(getattr(region, "t_start", None), getattr(region, "t_end", None))
                 filters.append(
                     f"{current}drawtext=text='{text}':fontsize={region.fontsize}:"
-                    f"fontcolor={fontcolor}:x={text_x}:y={text_y}{font_opt}{label}"
+                    f"fontcolor={fontcolor}:x={text_x}:y={text_y}{font_opt}{en}{label}"
                 )
                 current = label
 
         if instructions.replace_logo and logo_path and logo_path.is_file():
             inputs.extend(["-i", str(logo_path)])
             label = "[logo]"
+            # Logo overlays use full duration unless template entity supplies a window later
             filters.append(
                 f"[{input_index}:v]scale=iw*0.15:-1[lg];{current}[lg]overlay=20:20{label}"
             )
@@ -446,81 +530,17 @@ class FFmpegService:
         duration = await self.probe_duration(input_path)
 
         if instructions.replace_text and not resolved_regions:
-            if duration and duration > 3:
-                # Extra mid/late samples catch overlays that fade in after the open.
-                candidates = [
-                    min(max(duration * p, 0.5), max(duration - 0.5, 0.5))
-                    for p in (0.12, 0.22, 0.35, 0.50, 0.65)
-                ]
-            else:
-                candidates = [1.0]
-            sample_at_for_preview = candidates[0]
-
-            with tempfile.TemporaryDirectory(prefix="vgai_frame_") as tmp:
-                frame_paths: list[Path] = []
-                for idx, sample_at in enumerate(candidates):
-                    frame_path = Path(tmp) / f"sample_{idx}.png"
-                    if await self._extract_frame(input_path, frame_path, at_seconds=sample_at):
-                        frame_paths.append(frame_path)
-                if not frame_paths:
-                    raise RuntimeError("Failed to extract sample frames for OCR")
-
-                try:
-                    resolved_regions, best_frame = await asyncio.to_thread(
-                        ocr_best_regions_for_replacements,
-                        frame_paths,
-                        instructions.replace_text,
-                    )
-                except Exception as exc:
-                    if preview_dir is not None:
-                        preview_dir.mkdir(parents=True, exist_ok=True)
-                        await asyncio.to_thread(
-                            write_audit_snapshot,
-                            audit_dir_for_job(preview_dir),
-                            replacements=instructions.replace_text,
-                            frame_paths=frame_paths,
-                            sample_times=candidates,
-                            regions=[],
-                            best_frame=frame_paths[0],
-                            error=str(exc),
-                            dump_ocr=False,
-                            paint_still=False,
-                        )
-                    raise
-
-                logger.info(
-                    "OCR located %d text region(s) for in-place replace",
-                    len(resolved_regions),
-                )
-
-                # Keep a durable before-preview from the matched frame
-                if preview_dir is not None:
-                    preview_dir.mkdir(parents=True, exist_ok=True)
-                if best_frame is not None:
-                    durable = (preview_dir or output_path.parent) / "preview_before.png"
-                    if preview_dir is not None:
-                        preview_dir.mkdir(parents=True, exist_ok=True)
-                    durable.parent.mkdir(parents=True, exist_ok=True)
-                    durable.write_bytes(best_frame.read_bytes())
-                    preview_before = durable
-                    heal_source = durable
-                    try:
-                        idx = frame_paths.index(best_frame)
-                        sample_at_for_preview = candidates[idx]
-                    except ValueError:
-                        pass
-                if preview_dir is not None:
-                    await asyncio.to_thread(
-                        write_audit_snapshot,
-                        audit_dir_for_job(preview_dir),
-                        replacements=instructions.replace_text,
-                        frame_paths=frame_paths,
-                        sample_times=candidates,
-                        regions=resolved_regions,
-                        best_frame=best_frame,
-                        dump_ocr=False,
-                        paint_still=True,
-                    )
+            resolved_regions, preview_before, sample_at_for_preview = await self.locate_text_regions(
+                input_path,
+                instructions.replace_text,
+                preview_dir=preview_dir,
+                progress_cb=progress_cb,
+            )
+            heal_source = preview_before
+            logger.info(
+                "OCR located %d text region(s) for in-place replace",
+                len(resolved_regions),
+            )
 
         # Invisible heal patches for text replace (no opaque drawbox)
         healed_patches: list[HealedPatch] = []
@@ -586,16 +606,23 @@ class FFmpegService:
         else:
             cmd.extend(["-map", "0:v"])
 
+        vcodec = "libx264"
+        vextra: list[str] = ["-preset", "veryfast", "-crf", "23"]
+        hw = (self.settings.hwaccel or "").strip().lower()
+        if hw == "nvenc":
+            vcodec = "h264_nvenc"
+            vextra = ["-preset", "p4", "-cq", "23"]
+        elif hw == "qsv":
+            vcodec = "h264_qsv"
+            vextra = ["-global_quality", "23"]
+
         cmd.extend(
             [
                 "-map",
                 "0:a?",
                 "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
+                vcodec,
+                *vextra,
                 "-c:a",
                 "aac",
                 "-shortest",
@@ -685,10 +712,59 @@ class FFmpegService:
         if progress_cb:
             await progress_cb(100.0)
 
+        template_json: str | None = None
+        if resolved_regions:
+            size = await self.probe_video_size(input_path)
+            width, height = size if size else (1080, 1920)
+            dur = float(duration or 10.0)
+            logo_ents = []
+            if preview_before and preview_before.is_file():
+                try:
+                    t0 = min((r.t_start or 0.0) for r in resolved_regions)
+                    t1 = max((r.t_end or dur) for r in resolved_regions)
+                    logo_ents = await asyncio.to_thread(
+                        detect_logos_and_graphics,
+                        preview_before,
+                        t_start=t0,
+                        t_end=t1,
+                    )
+                except Exception as exc:
+                    logger.info("Vision detect skipped: %s", exc)
+            template = regions_to_template(
+                resolved_regions,
+                duration=dur,
+                width=width,
+                height=height,
+                logo_entities=logo_ents or None,
+            )
+            # Stamp inpaint mode from heal patches when available
+            mode_by_text = {p.from_text: p.mode for p in healed_patches}
+            ents = []
+            for ent in template.entities:
+                if ent.text and ent.text in mode_by_text:
+                    ents.append(ent.model_copy(update={"inpaint_mode": mode_by_text.get(ent.text)}))
+                else:
+                    # match by from via regions
+                    matched_mode = None
+                    for r in resolved_regions:
+                        if r.entity_id == ent.id or r.text == ent.text:
+                            matched_mode = "flat"
+                            break
+                    for p in healed_patches:
+                        if p.text == ent.text or p.from_text:
+                            matched_mode = "lama" if p.mode == "inpaint" else p.mode
+                            break
+                    ents.append(ent.model_copy(update={"inpaint_mode": matched_mode or ent.inpaint_mode}))
+            template = template.model_copy(update={"entities": ents})
+            template_json = template.model_dump_json()
+            if preview_dir is not None:
+                (preview_dir / "template.json").write_text(template_json, encoding="utf-8")
+
         return RenderResult(
             occurrences=len(resolved_regions),
             preview_before=preview_before if preview_before and preview_before.is_file() else None,
             preview_after=preview_after if preview_after and preview_after.is_file() else None,
+            template_json=template_json,
         )
 
     async def check_available(self) -> bool:

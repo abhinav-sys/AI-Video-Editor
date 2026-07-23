@@ -1,6 +1,9 @@
+"""Job worker: inline asyncio poller (dev) or Celery enqueue + lease reconciler."""
+
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
 from app.core.db import SessionLocal
@@ -18,22 +21,80 @@ class JobWorker:
         self.pipeline = RenderPipeline()
         self.creatomate_pipeline = CreatomatePipeline()
         self._task: asyncio.Task | None = None
+        self._reconcile_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._active: set[str] = set()
 
     async def start(self) -> None:
+        self._stop.clear()
+        if self._reconcile_task is None or self._reconcile_task.done():
+            self._reconcile_task = asyncio.create_task(
+                self._reconcile_loop(), name="job-reconciler"
+            )
+        if not self.settings.use_inline_worker:
+            logger.info("Inline job worker disabled (USE_INLINE_WORKER=false); Celery owns renders")
+            return
         if self._task and not self._task.done():
             return
-        self._stop.clear()
         self._task = asyncio.create_task(self._loop(), name="job-worker")
-        logger.info("Job worker started")
+        logger.info("Inline job worker started")
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
-            await self._task
-            self._task = None
+        for t in (self._task, self._reconcile_task):
+            if t:
+                await t
+        self._task = None
+        self._reconcile_task = None
         logger.info("Job worker stopped")
+
+    async def _reconcile_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._reconcile_stale()
+            except Exception:
+                logger.exception("Job reconcile error")
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    timeout=self.settings.job_reconcile_interval_sec,
+                )
+            except TimeoutError:
+                pass
+
+    def _reconcile_stale(self) -> None:
+        """Requeue jobs stuck in running without a recent heartbeat."""
+        lease = timedelta(seconds=max(30, self.settings.job_lease_seconds))
+        cutoff = datetime.now(timezone.utc) - lease
+        db = SessionLocal()
+        try:
+            stuck = (
+                db.query(Job)
+                .filter(Job.status == JobStatus.running)
+                .all()
+            )
+            for job in stuck:
+                hb = job.heartbeat_at or job.started_at or job.updated_at
+                if hb is None:
+                    continue
+                # Make naive/aware comparable
+                if hb.tzinfo is None:
+                    hb = hb.replace(tzinfo=timezone.utc)
+                if hb < cutoff:
+                    logger.warning("Requeuing stale job %s (last heartbeat %s)", job.id, hb)
+                    job.status = JobStatus.queued
+                    job.worker_id = None
+                    job.error = (job.error or "") + " | requeued after stale lease"
+                    db.commit()
+                    if not self.settings.use_inline_worker:
+                        try:
+                            from app.workers.tasks import enqueue_job
+
+                            enqueue_job(job.id)
+                        except Exception:
+                            logger.exception("Failed to re-enqueue stale job %s", job.id)
+        finally:
+            db.close()
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
@@ -68,7 +129,11 @@ class JobWorker:
             if job is None:
                 return None
             engine = getattr(job, "engine", None) or RenderEngine.bulkcut.value
+            now = datetime.now(timezone.utc)
             job.status = JobStatus.running
+            job.started_at = now
+            job.heartbeat_at = now
+            job.worker_id = "inline"
             db.commit()
             return job.id, engine
         finally:
@@ -76,12 +141,40 @@ class JobWorker:
 
     async def _run_job(self, job_id: str, engine: str) -> None:
         try:
-            if engine == RenderEngine.creatomate.value:
-                await self.creatomate_pipeline.process_job(job_id)
-            else:
-                await self.pipeline.process_job(job_id)
+            # Heartbeat while running
+            async def _beat() -> None:
+                while True:
+                    await asyncio.sleep(max(10.0, self.settings.job_lease_seconds / 3))
+                    db = SessionLocal()
+                    try:
+                        job = db.get(Job, job_id)
+                        if job is None or job.status != JobStatus.running:
+                            return
+                        job.heartbeat_at = datetime.now(timezone.utc)
+                        db.commit()
+                    finally:
+                        db.close()
+
+            beat = asyncio.create_task(_beat())
+            try:
+                if engine == RenderEngine.creatomate.value:
+                    await self.creatomate_pipeline.process_job(job_id)
+                else:
+                    await self.pipeline.process_job(job_id)
+            finally:
+                beat.cancel()
         finally:
             self._active.discard(job_id)
 
 
 worker = JobWorker()
+
+
+def dispatch_job(job_id: str) -> None:
+    """Called after create: enqueue Celery when inline worker is off."""
+    settings = get_settings()
+    if settings.use_inline_worker:
+        return
+    from app.workers.tasks import enqueue_job
+
+    enqueue_job(job_id)

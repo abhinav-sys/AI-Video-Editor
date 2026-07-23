@@ -6,10 +6,11 @@ import { useEffect, useState } from "react";
 
 import { DownloadButton } from "@/components/DownloadButton";
 import { JobProgress } from "@/components/JobProgress";
+import { TemplateEditor } from "@/components/TemplateEditor";
 import { cancelJob, getJob } from "@/lib/api";
 import type { JobResponse } from "@/lib/types";
 
-const TERMINAL = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL = new Set(["completed", "partial", "failed", "cancelled"]);
 
 export default function JobPage() {
   const params = useParams<{ id: string }>();
@@ -74,6 +75,17 @@ export default function JobPage() {
         {!job && !error && <p className="meta">Loading job…</p>}
         {error && <p className="error">{error}</p>}
         {job && <JobProgress job={job} />}
+        {job &&
+          job.items
+            .filter((i) => i.has_template)
+            .map((item) => (
+              <TemplateEditor
+                key={item.id}
+                jobId={job.id}
+                itemId={item.id}
+                filename={item.original_filename}
+              />
+            ))}
         {job && (
           <div className="actions" style={{ marginTop: "1.25rem" }}>
             <DownloadButton jobId={job.id} ready={job.download_ready} />

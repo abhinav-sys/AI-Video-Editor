@@ -85,6 +85,9 @@ class JobService:
         self.db.commit()
         self.db.refresh(job)
         logger.info("Created job %s with %d videos (engine=%s)", job.id, len(video_assets), engine)
+        from app.workers.runner import dispatch_job
+
+        dispatch_job(job.id)
         return job
 
     def create_creatomate_job(
@@ -164,6 +167,9 @@ class JobService:
             job.id,
             len(video_assets),
         )
+        from app.workers.runner import dispatch_job
+
+        dispatch_job(job.id)
         return job
 
     def get_job(self, job_id: str) -> Job | None:
@@ -195,6 +201,7 @@ class JobService:
                         if i.preview_after_path
                         else None
                     ),
+                    has_template=bool(getattr(i, "template_json", None)),
                     started_at=i.started_at,
                     finished_at=i.finished_at,
                 )
@@ -215,14 +222,19 @@ class JobService:
             created_at=job.created_at,
             updated_at=job.updated_at,
             completed_at=job.completed_at,
-            download_ready=job.status == JobStatus.completed and bool(job.zip_path),
+            download_ready=job.status in (JobStatus.completed, JobStatus.partial) and bool(job.zip_path),
         )
 
     def cancel_job(self, job_id: str) -> Job:
         job = self.get_job(job_id)
         if job is None:
             raise ValueError("Job not found")
-        if job.status in (JobStatus.completed, JobStatus.failed, JobStatus.cancelled):
+        if job.status in (
+            JobStatus.completed,
+            JobStatus.partial,
+            JobStatus.failed,
+            JobStatus.cancelled,
+        ):
             return job
         job.status = JobStatus.cancelled
         job.completed_at = datetime.now(timezone.utc)

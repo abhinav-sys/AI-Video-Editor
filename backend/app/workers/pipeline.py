@@ -66,9 +66,11 @@ class RenderPipeline:
             output_files = [Path(i.output_path) for i in completed if i.output_path]
             zip_path = self.zip_service.build_job_zip(job_id, output_files)
             job.zip_path = str(zip_path)
-            job.status = JobStatus.completed if not failed else JobStatus.completed
             if failed:
+                job.status = JobStatus.partial
                 job.error = f"{len(failed)} of {len(items)} items failed"
+            else:
+                job.status = JobStatus.completed
             job.completed_at = datetime.now(timezone.utc)
             db.commit()
             logger.info("Job %s completed (%d ok, %d failed)", job_id, len(completed), len(failed))
@@ -158,6 +160,8 @@ class RenderPipeline:
                 item.preview_after_path = (
                     str(result.preview_after) if result.preview_after else None
                 )
+                if getattr(result, "template_json", None):
+                    item.template_json = result.template_json
                 if result.occurrences:
                     item.error = None
                 item.finished_at = datetime.now(timezone.utc)

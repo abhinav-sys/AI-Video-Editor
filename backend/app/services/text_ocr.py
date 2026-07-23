@@ -50,6 +50,7 @@ class RenderRegion:
 
     `text` is what FFmpeg paints (usually only the replacement `to`).
     Old glyphs are removed via healed RGBA patches (no opaque drawbox).
+    Optional t_start/t_end gate the drawtext via enable=between.
     """
 
     x: int
@@ -67,6 +68,9 @@ class RenderRegion:
     baseline_y: int = 0
     fontfile: str | None = None
     text_y: int = 0
+    t_start: float | None = None
+    t_end: float | None = None
+    entity_id: str | None = None
 
 
 def normalize_text(value: str) -> str:
@@ -449,6 +453,23 @@ def _prepare_boosted_image(frame_path: Path, dest: Path, scale: float = _UPSCALE
     return scale
 
 
+def _easyocr_readtext(image_path: Path, *, reader_factory: Callable[[], object] | None) -> list:
+    """Run EasyOCR readtext in-process or via subprocess (default)."""
+    if reader_factory is not None:
+        reader = reader_factory()
+        return reader.readtext(str(image_path))  # type: ignore[attr-defined]
+
+    from app.config import get_settings
+
+    if get_settings().ocr_subprocess:
+        from app.services.easyocr_subprocess import get_easyocr_subprocess_client
+
+        return get_easyocr_subprocess_client().readtext(image_path)
+
+    reader = _get_easyocr_reader()
+    return reader.readtext(str(image_path))  # type: ignore[attr-defined]
+
+
 def read_ocr_boxes(
     frame_path: Path,
     *,
@@ -461,21 +482,16 @@ def read_ocr_boxes(
     if not path.is_file():
         return []
 
-    if reader_factory is not None:
-        reader = reader_factory()
-    else:
-        reader = _get_easyocr_reader()
-
     conf = min_conf if min_conf is not None else _MIN_CONF
 
     if not boosted:
-        results = reader.readtext(str(path))  # type: ignore[attr-defined]
+        results = _easyocr_readtext(path, reader_factory=reader_factory)
         return _parse_easyocr_results(results, scale=1.0, min_conf=conf)
 
     with tempfile.TemporaryDirectory(prefix="vgai_ocr_boost_") as tmp:
         boosted_path = Path(tmp) / "boosted.png"
         scale = _prepare_boosted_image(path, boosted_path)
-        results = reader.readtext(str(boosted_path))  # type: ignore[attr-defined]
+        results = _easyocr_readtext(boosted_path, reader_factory=reader_factory)
         return _parse_easyocr_results(results, scale=scale, min_conf=conf)
 
 
@@ -906,6 +922,16 @@ def ocr_best_regions_for_replacements(
                 fw, fh = fw2 or fw, fh2 or fh
             if err2 and not regions2:
                 raise err2 from partial_exc
-            assert_no_suspicious_partial(regions, replacements, frame_w=fw, frame_h=fh)
+            try:
+                assert_no_suspicious_partial(regions, replacements, frame_w=fw, frame_h=fh)
+            except ValueError as partial_exc2:
+                # Boost already ran; failing the whole job leaves mixed cities worse
+                # than replacing the one clear hit we found.
+                logger.warning(
+                    "Portrait short-token still looks partial after boost; "
+                    "proceeding with %d region(s): %s",
+                    len(regions),
+                    partial_exc2,
+                )
 
     return regions, best_frame

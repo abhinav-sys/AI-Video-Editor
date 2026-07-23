@@ -8,6 +8,7 @@ from app.api.deps import get_db, get_storage, require_api_key
 from app.api.schemas.uploads import UploadedFileInfo, UploadResponse
 from app.core.models import Asset, AssetKind, UploadBatch
 from app.services.storage import StorageService
+from app.services.upload_validation import sniff_is_image, sniff_is_video
 
 router = APIRouter(prefix="/uploads", tags=["uploads"], dependencies=[Depends(require_api_key)])
 
@@ -23,6 +24,9 @@ async def create_upload(
         raise HTTPException(status_code=400, detail="At least one video is required")
 
     settings_max = storage.settings.max_upload_bytes
+    # Cap total batch (all videos + assets) to 3× per-file max to prevent abuse
+    batch_cap = settings_max * max(3, len(videos) + len(assets))
+    batch_total = 0
     upload_id = storage.new_upload_id()
     batch = UploadBatch(id=upload_id)
     db.add(batch)
@@ -34,27 +38,49 @@ async def create_upload(
     asset_dir = storage.assets_dir(upload_id)
 
     async def _save(file: UploadFile, dest_dir, kind_hint: str | None = None) -> UploadedFileInfo:
+        nonlocal batch_total
         if not file.filename:
             raise HTTPException(status_code=400, detail="File missing filename")
         safe = storage.safe_filename(file.filename)
         classified = kind_hint or storage.classify(safe)
-        if classified == "video" and kind_hint != "video":
-            # when uploaded via assets field but is video — still treat by extension
-            pass
         dest = dest_dir / safe
         size = 0
+        header = b""
         async with aiofiles.open(dest, "wb") as out:
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
+                if size == 0:
+                    header = chunk[:64]
                 size += len(chunk)
+                batch_total += len(chunk)
                 if size > settings_max:
                     raise HTTPException(
                         status_code=413,
                         detail=f"File exceeds max upload size ({storage.settings.max_upload_size_mb} MB)",
                     )
+                if batch_total > batch_cap:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Batch upload exceeds total size limit",
+                    )
                 await out.write(chunk)
+
+        if kind_hint == "video" or classified == "video":
+            if not sniff_is_video(header):
+                dest.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File does not look like a video (magic bytes): {safe}",
+                )
+        elif classified in ("logo", "watermark", "other"):
+            # Assets should be images when provided
+            if header and not sniff_is_image(header) and not sniff_is_video(header):
+                # allow unknown small assets but reject obvious non-media
+                if header.startswith(b"MZ") or header.startswith(b"\x7fELF"):
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(status_code=400, detail=f"Executable uploads rejected: {safe}")
 
         kind_enum = {
             "video": AssetKind.video,
